@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+setup.py
+src/fprime_samd_ci/__init__.py
+src/fprime_samd_ci.egg-info/PKG-INFO
+src/fprime_samd_ci.egg-info/SOURCES.txt
+src/fprime_samd_ci.egg-info/dependency_links.txt
+src/fprime_samd_ci.egg-info/entry_points.txt
+src/fprime_samd_ci.egg-info/requires.txt
+src/fprime_samd_ci.egg-info/scm_version.json
+src/fprime_samd_ci.egg-info/top_level.txt
+src/fprime_samd_ci/plugins/__init__.py
+src/fprime_samd_ci/plugins/samd_ci.py

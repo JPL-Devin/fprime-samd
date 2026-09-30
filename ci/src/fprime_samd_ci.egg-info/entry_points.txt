@@ -1,0 +1,2 @@
+[fprime_gds]
+samd_ci = fprime_samd_ci.plugins.samd_ci:SamdCi
