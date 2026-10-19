@@ -321,7 +321,16 @@ void DmaDriver::handleInterrupt() {
 
             okReplies = completed;
 
-            if (keep != nullptr) {
+            if (keep != nullptr && !m_channels[id].isEnabled()) {
+                // The chain ran out and the channel auto-disabled before `keep` was linked
+                // (appendToChain patched a write-back the hardware had already consumed),
+                // so nothing will ever fetch it: reload it as the base descriptor and
+                // re-enable, exactly as a fresh transaction starts. The pool node is then
+                // free, like the first node of any transaction (see sendTransactionIn).
+                m_channels[id].restart(reinterpret_cast<DmacDescriptor*>(keep));
+                freeDescriptor(reinterpret_cast<DmacDescriptor*>(keep));
+                m_currentExecutingDesc[id] = reinterpret_cast<DmacDescriptor*>(&dmac_base[id]);
+            } else if (keep != nullptr) {
                 // Relink the anchor past the freed nodes so appendToChain never
                 // traverses a reclaimed slot; the boundary is the new oldest node.
                 dmac_base[id].DESCADDR.reg = reinterpret_cast<U32>(keep);

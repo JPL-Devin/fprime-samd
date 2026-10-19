@@ -112,6 +112,8 @@ This port is invoked **from ISR context** and must connect to a `sync input` han
 
 **Ordering guarantee:** `handleInterrupt` finishes all channel bookkeeping before any reply is emitted: the completed descriptor is released, the channel's in-flight state is updated, and the TCMPL/TERR/SUSP flags are cleared. Only then are the (OK or BUS_ERROR) replies delivered. A reply handler may therefore queue a new transaction — on the completing channel or on any other — and will observe the channel idle (or anchored on the chain boundary). Replying before the bookkeeping settled allowed a callback to append to a chain that the remainder of the ISR then detached, which asserted on the next TCMPL.
 
+**Append at the chain end:** `appendToChain` links a new node onto the SRAM tail and, when the write-back shows the hardware is executing the tail, also patches the write-back's `DESCADDR`. If the channel finished its last block (and auto-disabled) between that check and the patch — or before the append ran at all while the TCMPL interrupt was still pending — the hardware never sees the link. `handleInterrupt` closes this window: when the boundary node it keeps after releasing the completed descriptors is still unexecuted and the channel reads disabled, it reloads that node as the base descriptor and re-enables the channel (`DmaChannel::restart`), exactly as a fresh transaction starts. Without this the transaction stayed queued forever: on the reference deployment the UART TX chain stopped after one block and the downlink went silent.
+
 #### 3.4.3 Writeback State
 
 The `readWritebackIn` port returns a `Dma.Writeback` struct providing in-flight transfer state:
