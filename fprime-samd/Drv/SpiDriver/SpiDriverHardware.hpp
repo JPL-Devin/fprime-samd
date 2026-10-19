@@ -10,14 +10,27 @@
 #ifndef Samd21_SpiDriverHardware_HPP
 #define Samd21_SpiDriverHardware_HPP
 
+#include "Fw/Comp/PassiveComponentBase.hpp"
 #include "fprime-samd/Drv/SpiDriver/SpiDriver.hpp"
 #include "fprime-samd/Drv/Types/SercomKindEnumAc.hpp"
 
 namespace Samd21 {
 namespace SpiHardware {
 
+//! SERCOM SPI error state as seen from the ERROR interrupt.
+struct SpiErrorStatus {
+    bool error;           //!< INTFLAG.ERROR: an error interrupt is pending
+    bool bufferOverflow;  //!< STATUS.BUFOVF: a received character was lost
+};
+
 //! Hardware abstraction layer for the SERCOM SPI host peripheral.
 struct SpiHal {
+    //! Register the SERCOM interrupt callback for this driver instance.
+    //! Must be called before configure(), which enables the ERROR interrupt.
+    static void registerIsr(SercomKind sercom,
+                            void (*callback)(Fw::PassiveComponentBase*, SercomKind),
+                            Fw::PassiveComponentBase* data);
+
     //! Configure and enable the SERCOM peripheral for SPI host operation.
     //!
     //! Performs the §27.6.2.1 initialization sequence (clock gating, GCLK
@@ -35,6 +48,14 @@ struct SpiHal {
 
     //! Address of the SERCOM SPI DATA register (DMA source for MISO, destination for MOSI).
     static U32 getDataRegisterAddress(SercomKind sercom);
+
+    //! Read the error interrupt state (INTFLAG.ERROR, STATUS.BUFOVF). ISR context.
+    static SpiErrorStatus readErrorStatus(SercomKind sercom);
+
+    //! Acknowledge an error after the DMA streams have been stopped: wait (bounded) for
+    //! the shifter to go idle, write-1-clear STATUS.BUFOVF, drain any character left in
+    //! DATA and clear INTFLAG.ERROR so the interrupt does not re-fire. ISR context.
+    static void acknowledgeError(SercomKind sercom);
 };
 
 //! Test-only hooks into the stub hardware implementation.
@@ -57,7 +78,21 @@ struct StubState {
 
     // getDataRegisterAddress() control
     U32 data_register_address;
+
+    // registerIsr() capture
+    void (*isr_callback)(Fw::PassiveComponentBase*, SercomKind);
+    Fw::PassiveComponentBase* isr_data;
+    SercomKind isr_sercom;
+
+    // readErrorStatus() injected value
+    SpiErrorStatus error_status;
+
+    // acknowledgeError() capture
+    U32 acknowledge_error_count;
 };
+
+//! Invoke the registered ISR callback as the SERCOM interrupt would
+void fireIsr();
 
 //! Get the mutable stub state (shared across all HAL calls)
 StubState& getStubState();

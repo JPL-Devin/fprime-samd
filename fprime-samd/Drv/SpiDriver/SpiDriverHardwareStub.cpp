@@ -23,6 +23,20 @@ void resetStubState() {
     s_state = StubState{};
 }
 
+void fireIsr() {
+    if (s_state.isr_callback != nullptr) {
+        s_state.isr_callback(s_state.isr_data, s_state.isr_sercom);
+    }
+}
+
+void SpiHal::registerIsr(SercomKind sercom,
+                         void (*callback)(Fw::PassiveComponentBase*, SercomKind),
+                         Fw::PassiveComponentBase* data) {
+    s_state.isr_callback = callback;
+    s_state.isr_data = data;
+    s_state.isr_sercom = sercom;
+}
+
 void SpiHal::configure(SercomKind sercom,
                        U32 baud_rate_khz,
                        SpiDriver::DataOrder data_order,
@@ -48,6 +62,18 @@ void SpiHal::configure(SercomKind sercom,
 U32 SpiHal::getDataRegisterAddress(SercomKind sercom) {
     (void)sercom;
     return s_state.data_register_address;
+}
+
+SpiErrorStatus SpiHal::readErrorStatus(SercomKind sercom) {
+    (void)sercom;
+    return s_state.error_status;
+}
+
+void SpiHal::acknowledgeError(SercomKind sercom) {
+    (void)sercom;
+    s_state.acknowledge_error_count++;
+    // Model the write-1-clear: nothing is pending after the acknowledge
+    s_state.error_status = SpiErrorStatus{};
 }
 
 }  // namespace SpiHardware

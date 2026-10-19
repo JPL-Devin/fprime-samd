@@ -56,6 +56,26 @@ TEST(OffNominal, SizeMismatch) {
     tester.testSizeMismatch();
 }
 
+TEST(OffNominal, ReceiveOverrun) {
+    Samd21::SpiDriverTester tester;
+    tester.testReceiveOverrun();
+}
+
+TEST(OffNominal, ReceiveOverrunAfterTxComplete) {
+    Samd21::SpiDriverTester tester;
+    tester.testReceiveOverrunAfterTxComplete();
+}
+
+TEST(OffNominal, SpuriousInterrupt) {
+    Samd21::SpiDriverTester tester;
+    tester.testSpuriousInterrupt();
+}
+
+TEST(OffNominal, ReceiveOverrunIdle) {
+    Samd21::SpiDriverTester tester;
+    tester.testReceiveOverrunIdle();
+}
+
 TEST(OffNominal, UnexpectedDmaReply) {
     Samd21::SpiDriverTester tester;
     tester.testUnexpectedDmaReply();

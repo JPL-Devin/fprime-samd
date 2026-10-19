@@ -37,6 +37,10 @@ selects on `FPRIME_PLATFORM`.
 | SPI-XFER-003 | One transaction at a time: an overlapping request on any port shall be answered synchronously with `SPI_OTHER_ERR` and generate no DMA or chip-select traffic. | Unit Test |
 | SPI-XFER-004 | With hardware chip select the transaction shall not drive the GPIO ports. | Unit Test |
 | SPI-XFER-005 | A DMA completion with nothing in flight, or a duplicate completion of one channel, shall assert. | Unit Test |
+| SPI-ERR-001 | `configure()` shall register for the SERCOM interrupt and enable only its `ERROR` source (receive buffer overflow, `STATUS.BUFOVF`), at the same NVIC priority as the DMAC interrupt. | Unit Test, Hardware Test |
+| SPI-ERR-002 | On a receive overrun during a transaction the driver shall abort every DMA stream still outstanding via `dmaTransactionAbortOut`, acknowledge the hardware (wait for the shifter to go idle, clear `BUFOVF`, drain `DATA`, clear `INTFLAG.ERROR`), deassert the chip select (software mode) and reply on the requesting port with `SPI_OTHER_ERR` and the caller's buffers. | Unit Test, Hardware Test |
+| SPI-ERR-003 | After an overrun reply the driver shall accept a new transaction immediately. | Unit Test, Hardware Test |
+| SPI-ERR-004 | A SERCOM interrupt without `INTFLAG.ERROR`, or an overrun with no transaction in flight, shall not abort, reply or alter the transaction state (the latter is acknowledged). | Unit Test |
 
 ## 3. Design
 
@@ -47,6 +51,7 @@ selects on `FPRIME_PLATFORM`.
 | sync input | `SpiWriteRead[SpiPorts]` | `Samd21.SpiWriteRead` | from `Samd21.AsyncSpi` |
 | output | `SpiReply[SpiPorts]` | `Samd21.SpiReply` | **ISR context** on success; synchronous on busy reject |
 | output | `dmaTransactionOut[DmaChannel.N]` | `Dma.Transaction` | `MOSI`, `MISO` |
+| output | `dmaTransactionAbortOut[DmaChannel.N]` | `Fw.Signal` | abort a stream after a receive overrun; **ISR context** |
 | sync input | `dmaReplyIn[DmaChannel.N]` | `Dma.TransactionReply` | **ISR context** |
 | output | `chipSelectGpioOut[SpiPorts]` | `Drv.GpioWrite` | software chip select only |
 
@@ -75,6 +80,24 @@ particular they must **not** queue a new SPI transaction from inside the callbac
 
 ### 3.4 Error handling
 
+**Receive overrun.** The SERCOM receive buffer is two characters deep. If the MISO DMA
+channel loses arbitration for longer than two character times (observed on hardware at
+12 MHz SCK with the UART and I2C channels on the same DMAC priority level), the SERCOM
+drops a character and sets `STATUS.BUFOVF`/`INTFLAG.ERROR`. The MISO DMA block can then
+never reach its count and, without intervention, the transaction never completes.
+`configure()` therefore enables the SERCOM `ERROR` interrupt; `isrHandler()` aborts the
+outstanding stream(s) through `dmaTransactionAbortOut` (the DMA driver clears the
+channel's pending flags and raises no reply), acknowledges the overflow (bounded wait for
+`TXC` so the character still in the shifter cannot land after the drain, write-1-clear
+`BUFOVF`, drain `DATA`, clear `TXC`/`ERROR`), deasserts the software chip select and emits
+`SpiReply` with `SPI_OTHER_ERR` and the caller's buffers. The SERCOM and DMAC interrupts share the lowest
+NVIC priority, so neither handler preempts the other inside the driver. The reply is in
+ISR context, like the success path. A busy reject (synchronous) and an overrun (ISR) both
+use `SPI_OTHER_ERR`; `Drv.SpiStatus` has no finer value for a receive fault.
+
+Nothing in the stack detects a transfer that produces no clock at all (e.g. SERCOM clock
+gated); that failure mode has not been observed and a tick-based timeout is left for §6.
+
 The DMA status is not currently folded into the reply (DMA bus errors surface as
 `Samd21.DmaDriver` ISR replies with `BUS_ERROR`; the SPI reply remains `SPI_OK`) — see
 §6. Programming errors (unconfigured, size mismatch, stray DMA reply, reconfigure) assert.
@@ -89,11 +112,16 @@ channels, a `Samd21.GpioDriver` chip select, and the `configComponents` phase.
 `test/ut/` runs natively against the stub HAL: configuration in both chip-select modes,
 reconfigure assert, request before configure, nominal transactions in both DMA completion
 orders on every port, busy rejection on the same and other ports, hardware chip select,
-size mismatch, stray/duplicate DMA replies, BAUD boundaries and overflow, and 500
-randomized transactions.
+size mismatch, stray/duplicate DMA replies, BAUD boundaries and overflow, 500
+randomized transactions, and the receive-overrun path (both streams outstanding, one
+stream outstanding, spurious interrupt, overrun while idle, recovery on every port and in
+both chip-select modes) driven through the stub HAL's `fireIsr()`.
 
 ## 6. Future work
 
-- Propagate DMA `BUS_ERROR` into `SpiReply` as `SPI_READ_ERR`/`SPI_WRITE_ERR`.
+- Propagate DMA `BUS_ERROR` into `SpiReply` as `SPI_WRITE_ERR`/`SPI_OTHER_ERR`.
+- A tick-based completion timeout for faults that raise no SERCOM flag (none observed).
+- Raise the MISO channel above the MOSI/UART channels in DMAC priority so the overrun
+  does not occur in the first place at high SCK rates.
 - A main-context completion option (`activeIn`), mirroring `Samd21.I2cDriver`, so
   clients need not implement the hop themselves.

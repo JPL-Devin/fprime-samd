@@ -85,6 +85,9 @@ void SpiDriver ::configure(SercomKind sercom,
         }
     }
 
+    // Register for the ERROR interrupt that configure() enables below
+    SpiHardware::SpiHal::registerIsr(sercom, SpiDriver::s_spiDriverIsrHandler, this);
+
     SpiHardware::SpiHal::configure(sercom, baud_rate_khz, data_order, clock_polarity, clock_phase, data_in_pinout,
                                    data_out_pinout, run_in_standby, hardware_chipselect);
 
@@ -140,7 +143,8 @@ void SpiDriver ::dmaReplyIn_handler(FwIndexType portNum, const Samd21::Dma::Repl
     // We will get two replies (Tx, Rx) but the order is not guarenteed since they should finish at the same time.
     // We should reply to the transaction after we got both of the replies back
     FW_ASSERT(this->m_configured, this->m_sercom, this->m_portNum);
-    FW_ASSERT(this->m_busy != 0, this->m_sercom, this->m_portNum);
+    FW_ASSERT(this->m_busy != 0, this->m_sercom, this->m_portNum, portNum,
+              static_cast<FwAssertArgType>(reply.get_status()));
 
     if (portNum == SpiDriver_DmaChannel::MISO) {
         FW_ASSERT(this->m_busy & BusyBit::RX_BUSY, this->m_sercom, portNum);
@@ -166,6 +170,59 @@ void SpiDriver ::dmaReplyIn_handler(FwIndexType portNum, const Samd21::Dma::Repl
 
         this->SpiReply_out(this->m_portNum, write, read, Drv::SpiStatus::SPI_OK);
     }
+}
+
+// ----------------------------------------------------------------------
+// SERCOM interrupt handling
+// ----------------------------------------------------------------------
+
+void SpiDriver ::s_spiDriverIsrHandler(Fw::PassiveComponentBase* spiDriverRaw, SercomKind sercom) {
+    auto spiDriver = reinterpret_cast<SpiDriver*>(spiDriverRaw);
+
+    FW_ASSERT(spiDriver != nullptr);
+    FW_ASSERT(sercom == spiDriver->m_sercom, sercom, spiDriver->m_sercom);
+    spiDriver->isrHandler();
+}
+
+void SpiDriver ::isrHandler() {
+    FW_ASSERT(this->m_configured, this->m_sercom);
+    const SpiHardware::SpiErrorStatus status = SpiHardware::SpiHal::readErrorStatus(this->m_sercom);
+    if (!status.error) {
+        // ERROR is the only interrupt enabled; anything else is spurious
+        return;
+    }
+
+    // Stop the DMA streams that have not completed before touching the peripheral, so
+    // no further characters are pushed while the receiver is drained. The DMA driver
+    // raises no reply for an aborted channel and clears its pending flags, so no stale
+    // dmaReplyIn follows.
+    if (this->m_busy & BusyBit::RX_BUSY) {
+        this->dmaTransactionAbortOut_out(SpiDriver_DmaChannel::MISO);
+    }
+    if (this->m_busy & BusyBit::TX_BUSY) {
+        this->dmaTransactionAbortOut_out(SpiDriver_DmaChannel::MOSI);
+    }
+
+    // Let the shifter finish, drain the receiver and clear the flags so the interrupt
+    // cannot re-fire and the next transfer starts on an empty receive buffer.
+    SpiHardware::SpiHal::acknowledgeError(this->m_sercom);
+
+    if (this->m_busy == 0) {
+        // Nothing in flight to fail (the transfer finished before the flag was seen)
+        return;
+    }
+    this->m_busy = 0;
+
+    auto read = this->m_read.getBuffer();
+    auto write = this->m_write.getBuffer();
+
+    if (!this->m_hardware_chip_select) {
+        if (this->isConnected_chipSelectGpioOut_OutputPort(this->m_portNum)) {
+            this->chipSelectGpioOut_out(this->m_portNum, Fw::Logic::HIGH);
+        }
+    }
+
+    this->SpiReply_out(this->m_portNum, write, read, Drv::SpiStatus::SPI_OTHER_ERR);
 }
 
 }  // namespace Samd21

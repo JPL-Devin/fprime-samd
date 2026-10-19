@@ -83,6 +83,10 @@ class SpiDriverTester final : public SpiDriverGTestBase {
 
     //! Randomized ports, sizes and DMA completion orders
     void testRandomTransactions();
+    void testReceiveOverrun();
+    void testReceiveOverrunAfterTxComplete();
+    void testSpuriousInterrupt();
+    void testReceiveOverrunIdle();
 
   private:
     // ----------------------------------------------------------------------
@@ -96,6 +100,7 @@ class SpiDriverTester final : public SpiDriverGTestBase {
                                const Drv::SpiStatus& status) override;
 
     Drv::GpioStatus from_chipSelectGpioOut_handler(FwIndexType portNum, const Fw::Logic& state) override;
+    void from_dmaTransactionAbortOut_handler(FwIndexType portNum) override;
 
     void from_dmaTransactionOut_handler(FwIndexType portNum,
                                         const Samd21::Dma::TriggerSource& trigger,
@@ -141,6 +146,8 @@ class SpiDriverTester final : public SpiDriverGTestBase {
 
     //! Assert exactly one reply was emitted on port with the request buffers and status
     void assertReply(FwIndexType port, Drv::SpiStatus::T status);
+    void injectOverrun();
+    void assertAbort(FwSizeType index, SpiDriver_DmaChannel::T channel);
 
     //! Address of a buffer as the DMA port carries it
     static U32 address(const U8* data);
@@ -163,6 +170,7 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     FwIndexType m_replyPorts[MAX_HISTORY_SIZE];
     FwIndexType m_chipSelectPorts[MAX_HISTORY_SIZE];
     FwIndexType m_dmaPorts[MAX_HISTORY_SIZE];
+    FwIndexType m_abortPorts[MAX_HISTORY_SIZE];
 
     //! Whether the component was configured with hardware chip select
     bool m_hardwareChipSelect;

@@ -36,6 +36,36 @@ static void waitForSpiSync(Sercom* sercom_hw, U32 mask) {
     FW_ASSERT(limit != 0);
 }
 
+static ::IRQn_Type getSercomIrq(SercomKind sercom) {
+    switch (sercom.e) {
+        case SercomKind::SERCOM_0:
+            return IRQn_Type::SERCOM0_IRQn;
+        case SercomKind::SERCOM_1:
+            return IRQn_Type::SERCOM1_IRQn;
+        case SercomKind::SERCOM_2:
+            return IRQn_Type::SERCOM2_IRQn;
+        case SercomKind::SERCOM_3:
+            return IRQn_Type::SERCOM3_IRQn;
+#ifdef SERCOM4
+        case SercomKind::SERCOM_4:
+            return IRQn_Type::SERCOM4_IRQn;
+#endif
+#ifdef SERCOM5
+        case SercomKind::SERCOM_5:
+            return IRQn_Type::SERCOM5_IRQn;
+#endif
+        default:
+            FW_ASSERT(false, static_cast<FwAssertArgType>(sercom));
+            return IRQn_Type::SERCOM0_IRQn;
+    }
+}
+
+void SpiHal::registerIsr(SercomKind sercom,
+                         void (*callback)(Fw::PassiveComponentBase*, SercomKind),
+                         Fw::PassiveComponentBase* data) {
+    SercomUtil::registerIsrHandler(sercom, callback, data);
+}
+
 void SpiHal::configure(SercomKind sercom,
                        U32 baud_rate_khz,
                        SpiDriver::DataOrder data_order,
@@ -225,6 +255,16 @@ void SpiHal::configure(SercomKind sercom,
     // Program the baud rate to generate the target SCK.
     sercom_hw->SPI.BAUD.reg = SERCOM_SPI_BAUD_BAUD(SpiDriver::calculateBaud(F_CPU, baud_rate_khz));
 
+    // Enable only the ERROR interrupt: in host mode its single source is the receive
+    // buffer overflow (STATUS.BUFOVF), after which the MISO DMA block can never
+    // complete. The ISR runs at the same (lowest) priority as the DMAC ISR so the two
+    // never preempt each other inside the driver.
+    sercom_hw->SPI.INTENSET.reg = SERCOM_SPI_INTENSET_ERROR;
+    static constexpr U32 LOWEST_PRIORITY = (1U << __NVIC_PRIO_BITS) - 1;
+    const ::IRQn_Type irqn = getSercomIrq(sercom);
+    NVIC_SetPriority(irqn, LOWEST_PRIORITY);
+    NVIC_EnableIRQ(irqn);
+
     // Enable the peripheral.
     sercom_hw->SPI.CTRLA.reg |= SERCOM_SPI_CTRLA_ENABLE;
     waitForSpiSync(sercom_hw, SERCOM_SPI_SYNCBUSY_ENABLE);
@@ -234,6 +274,43 @@ U32 SpiHal::getDataRegisterAddress(SercomKind sercom) {
     auto* sercom_hw = SercomUtil::getHardware(sercom);
     FW_ASSERT(sercom_hw != nullptr, sercom.e);
     return reinterpret_cast<U32>(&sercom_hw->SPI.DATA);
+}
+
+SpiErrorStatus SpiHal::readErrorStatus(SercomKind sercom) {
+    auto* sercom_hw = SercomUtil::getHardware(sercom);
+    FW_ASSERT(sercom_hw != nullptr, sercom.e);
+
+    SpiErrorStatus status = {};
+    status.error = (sercom_hw->SPI.INTFLAG.reg & SERCOM_SPI_INTFLAG_ERROR) != 0;
+    status.bufferOverflow = sercom_hw->SPI.STATUS.bit.BUFOVF != 0;
+    return status;
+}
+
+void SpiHal::acknowledgeError(SercomKind sercom) {
+    auto* sercom_hw = SercomUtil::getHardware(sercom);
+    FW_ASSERT(sercom_hw != nullptr, sercom.e);
+
+    // The caller has already stopped the DMA streams, so DATA receives no new
+    // characters; wait (bounded, well above one character time at the slowest BAUD)
+    // for the one still in the shifter to finish so it cannot land in the receive
+    // buffer after the drain below.
+    volatile U32 limit = F_CPU / 100;
+    while (limit > 0 && !(sercom_hw->SPI.INTFLAG.reg & SERCOM_SPI_INTFLAG_TXC)) {
+        limit--;
+    }
+
+    // STATUS.BUFOVF is write-1-clear (§27.8.9). Clearing it re-arms the receiver.
+    if (sercom_hw->SPI.STATUS.bit.BUFOVF) {
+        sercom_hw->SPI.STATUS.reg = SERCOM_SPI_STATUS_BUFOVF;
+    }
+
+    // Drain whatever the receiver still holds so the next transfer's MISO DMA does
+    // not start on stale characters. The buffer is two deep; bound the loop anyway.
+    for (U32 i = 0; i < 4 && (sercom_hw->SPI.INTFLAG.reg & SERCOM_SPI_INTFLAG_RXC); i++) {
+        (void)sercom_hw->SPI.DATA.reg;
+    }
+
+    sercom_hw->SPI.INTFLAG.reg = SERCOM_SPI_INTFLAG_TXC | SERCOM_SPI_INTFLAG_ERROR;
 }
 
 }  // namespace SpiHardware

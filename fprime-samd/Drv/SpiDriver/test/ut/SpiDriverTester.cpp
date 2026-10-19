@@ -232,6 +232,107 @@ void SpiDriverTester ::testRandomTransactions() {
     }
 }
 
+void SpiDriverTester ::testReceiveOverrun() {
+    // REQUIREMENT(SPI-ERR-001): the ISR is registered for the configured SERCOM
+    this->configure(SpiDriver::HardwareChipSelect::DISABLED);
+    const SpiHardware::StubState& stub = SpiHardware::getStubState();
+    ASSERT_NE(stub.isr_callback, nullptr);
+    ASSERT_EQ(stub.isr_sercom, SercomKind(TEST_SERCOM));
+
+    // REQUIREMENT(SPI-ERR-002): an overrun with both streams in flight aborts MISO and MOSI,
+    //                           acknowledges the hardware, releases the chip select and fails the
+    //                           transaction on the requesting port with the caller's buffers
+    for (FwIndexType port = 0; port < Samd21::SpiPorts; port++) {
+        this->startTransaction(port, 16);
+        this->clearAll();
+        this->injectOverrun();
+        ASSERT_EQ(stub.acknowledge_error_count, static_cast<U32>(port + 1));
+        ASSERT_from_dmaTransactionAbortOut_SIZE(2);
+        this->assertAbort(0, SpiDriver_DmaChannel::MISO);
+        this->assertAbort(1, SpiDriver_DmaChannel::MOSI);
+        ASSERT_from_chipSelectGpioOut_SIZE(1);
+        this->assertChipSelect(0, port, Fw::Logic::HIGH);
+        this->assertReply(port, Drv::SpiStatus::SPI_OTHER_ERR);
+        ASSERT_from_dmaTransactionOut_SIZE(0);
+
+        // REQUIREMENT(SPI-ERR-003): the bus is free again immediately after the failure
+        this->startTransaction(port, 4);
+        this->finishTransaction(port, port % 2 == 0);
+    }
+
+    // Hardware chip select: no GPIO traffic on the error path either
+    SpiDriverTester hw;
+    hw.configure(SpiDriver::HardwareChipSelect::ENABLED);
+    hw.startTransaction(1, 8);
+    hw.clearAll();
+    hw.injectOverrun();
+    ASSERT_EQ(hw.fromPortHistorySize_dmaTransactionAbortOut, 2u);
+    hw.assertReply(1, Drv::SpiStatus::SPI_OTHER_ERR);
+    ASSERT_EQ(hw.fromPortHistory_chipSelectGpioOut->size(), 0u);
+}
+
+void SpiDriverTester ::testReceiveOverrunAfterTxComplete() {
+    // REQUIREMENT(SPI-ERR-002): only the stream still outstanding is aborted. MOSI finishing
+    //                           first is the hardware case: every character was shifted out, the
+    //                           receiver dropped one, and MISO can never reach its count.
+    this->configure(SpiDriver::HardwareChipSelect::DISABLED);
+    this->startTransaction(0, 132);
+    this->completeDma(SpiDriver_DmaChannel::MOSI);
+    this->clearAll();
+    this->injectOverrun();
+    ASSERT_from_dmaTransactionAbortOut_SIZE(1);
+    this->assertAbort(0, SpiDriver_DmaChannel::MISO);
+    this->assertChipSelect(0, 0, Fw::Logic::HIGH);
+    this->assertReply(0, Drv::SpiStatus::SPI_OTHER_ERR);
+
+    // A late MISO completion after the abort is a protocol violation (the DMA driver clears it)
+    ASSERT_DEATH_IF_SUPPORTED(this->completeDma(SpiDriver_DmaChannel::MISO), "");
+
+    // Mirror case: MISO done, MOSI outstanding
+    this->startTransaction(1, 8);
+    this->completeDma(SpiDriver_DmaChannel::MISO);
+    this->clearAll();
+    this->injectOverrun();
+    ASSERT_from_dmaTransactionAbortOut_SIZE(1);
+    this->assertAbort(0, SpiDriver_DmaChannel::MOSI);
+    this->assertReply(1, Drv::SpiStatus::SPI_OTHER_ERR);
+    this->startTransaction(1, 2);
+    this->finishTransaction(1, true);
+}
+
+void SpiDriverTester ::testSpuriousInterrupt() {
+    // REQUIREMENT(SPI-ERR-004): an interrupt without INTFLAG.ERROR is ignored: no acknowledge,
+    //                           no abort, no reply, transaction continues
+    this->configure(SpiDriver::HardwareChipSelect::DISABLED);
+    this->startTransaction(0, 8);
+    this->clearAll();
+    SpiHardware::fireIsr();
+    ASSERT_EQ(SpiHardware::getStubState().acknowledge_error_count, 0u);
+    ASSERT_from_dmaTransactionAbortOut_SIZE(0);
+    ASSERT_from_SpiReply_SIZE(0);
+    ASSERT_from_chipSelectGpioOut_SIZE(0);
+    this->finishTransaction(0, true);
+}
+
+void SpiDriverTester ::testReceiveOverrunIdle() {
+    // REQUIREMENT(SPI-ERR-004): an overrun with nothing in flight is acknowledged and otherwise
+    //                           ignored; the next transaction proceeds normally
+    this->configure(SpiDriver::HardwareChipSelect::DISABLED);
+    this->injectOverrun();
+    ASSERT_EQ(SpiHardware::getStubState().acknowledge_error_count, 1u);
+    ASSERT_from_dmaTransactionAbortOut_SIZE(0);
+    ASSERT_from_SpiReply_SIZE(0);
+    ASSERT_from_chipSelectGpioOut_SIZE(0);
+    this->startTransaction(2, 8);
+    this->finishTransaction(2, false);
+
+    // Before configure() there is no ISR registered, so the hardware hook is inert
+    SpiDriverTester fresh;
+    SpiHardware::resetStubState();
+    SpiHardware::fireIsr();
+    ASSERT_EQ(fresh.fromPortHistory_SpiReply->size(), 0u);
+}
+
 // ----------------------------------------------------------------------
 // Handlers for typed from ports
 // ----------------------------------------------------------------------
@@ -244,6 +345,14 @@ void SpiDriverTester ::from_SpiReply_handler(FwIndexType portNum,
     this->pushFromPortEntry_SpiReply(writeBuffer, readBuffer, status);
     if (index < MAX_HISTORY_SIZE) {
         this->m_replyPorts[index] = portNum;
+    }
+}
+
+void SpiDriverTester ::from_dmaTransactionAbortOut_handler(FwIndexType portNum) {
+    const FwSizeType index = this->fromPortHistorySize_dmaTransactionAbortOut;
+    this->pushFromPortEntry_dmaTransactionAbortOut();
+    if (index < MAX_HISTORY_SIZE) {
+        this->m_abortPorts[index] = portNum;
     }
 }
 
@@ -286,6 +395,7 @@ void SpiDriverTester ::clearAll() {
         this->m_replyPorts[i] = -1;
         this->m_chipSelectPorts[i] = -1;
         this->m_dmaPorts[i] = -1;
+        this->m_abortPorts[i] = -1;
     }
 }
 
@@ -368,6 +478,17 @@ void SpiDriverTester ::assertReply(FwIndexType port, Drv::SpiStatus::T status) {
     ASSERT_EQ(entry.writeBuffer.getSize(), this->m_writeBuffer[port].getSize());
     ASSERT_EQ(entry.readBuffer.getData(), this->m_readBuffer[port].getData());
     ASSERT_EQ(entry.readBuffer.getSize(), this->m_readBuffer[port].getSize());
+}
+
+void SpiDriverTester ::injectOverrun() {
+    SpiHardware::StubState& stub = SpiHardware::getStubState();
+    stub.error_status.error = true;
+    stub.error_status.bufferOverflow = true;
+    SpiHardware::fireIsr();
+}
+
+void SpiDriverTester ::assertAbort(FwSizeType index, SpiDriver_DmaChannel::T channel) {
+    ASSERT_EQ(this->m_abortPorts[index], static_cast<FwIndexType>(channel));
 }
 
 U32 SpiDriverTester ::address(const U8* data) {

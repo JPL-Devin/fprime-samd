@@ -7,6 +7,7 @@
 #ifndef Samd21_SpiDriver_HPP
 #define Samd21_SpiDriver_HPP
 
+#include "Fw/Comp/PassiveComponentBase.hpp"
 #include "config/FwIndexTypeAliasAc.h"
 #include "fprime-samd/Drv/SpiDriver/SpiDriverComponentAc.hpp"
 #include "fprime-samd/Drv/Types/SercomKindEnumAc.hpp"
@@ -124,6 +125,18 @@ class SpiDriver final : public SpiDriverComponentBase {
     //! This signal comes inside an ISR!
     void dmaReplyIn_handler(FwIndexType portNum,  //!< The port number
                             const Samd21::Dma::Reply& reply) override;
+
+    // ----------------------------------------------------------------------
+    // SERCOM interrupt handling
+    // ----------------------------------------------------------------------
+
+    //! Trampoline registered with the SERCOM ISR table
+    static void s_spiDriverIsrHandler(Fw::PassiveComponentBase* spiDriverRaw, SercomKind sercom);
+
+    //! SERCOM ERROR interrupt: a receive overrun lost a character, so the MISO DMA
+    //! block can never complete. Abort the outstanding DMA streams, release the
+    //! chip select and fail the transaction back to the caller. ISR context.
+    void isrHandler();
 
     SercomKind m_sercom;
 

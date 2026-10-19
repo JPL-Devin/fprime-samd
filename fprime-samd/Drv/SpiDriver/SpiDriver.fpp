@@ -15,6 +15,10 @@ module Samd21 {
         @ Port to send a DMA transaction to the DMA driver
         output port dmaTransactionOut: [DmaChannel.N] Dma.Transaction
 
+        @ Port to abort the DMA transaction still running on a channel. Used from the
+        @ SERCOM error ISR when a receive overrun has made the transfer unable to finish.
+        output port dmaTransactionAbortOut: [DmaChannel.N] Fw.Signal
+
         @ A signal from the DMAC that a request has finished.
         @ This signal comes inside an ISR!
         sync input port dmaReplyIn: [DmaChannel.N] Dma.TransactionReply
