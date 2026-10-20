@@ -104,7 +104,7 @@ The DMA status is not currently folded into the reply (DMA bus errors surface as
 
 ## 4. Integration
 
-See `fprime-devices/Fram/Subtopology/Subtopology.fpp` for a complete example: two DMA
+See `fprime-samd/Devices/Fram/Subtopology/Subtopology.fpp` for a complete example: two DMA
 channels, a `Samd21.GpioDriver` chip select, and the `configComponents` phase.
 
 ## 5. Unit tests
