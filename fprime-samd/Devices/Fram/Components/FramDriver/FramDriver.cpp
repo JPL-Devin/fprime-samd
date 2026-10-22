@@ -121,7 +121,7 @@ void FramDriver ::spiReplyIn_handler(FwIndexType portNum,
     }
 }
 
-void FramDriver ::schedIn_handler(FwIndexType portNum, U32 context) {
+bool FramDriver ::activeIn_handler(FwIndexType portNum, U32 context) {
     // REQ-FRAM-018: the first scheduled call starts the startup transactions; later calls
     // have nothing to do (replies arrive on spiReplyIn in main context).
     if (this->m_state == State::STARTUP) {
@@ -129,6 +129,7 @@ void FramDriver ::schedIn_handler(FwIndexType portNum, U32 context) {
         this->m_tx[0] = OPCODE_RDID;
         this->issue(State::ID_IN_FLIGHT, 1 + Fram::DEVICE_ID_SIZE);
     }
+    return false;
 }
 
 // ----------------------------------------------------------------------

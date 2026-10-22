@@ -26,8 +26,8 @@ module Fram {
         instance spiDriver
 
         @ The deployment must also schedule both drivers in main context, SPI host first:
-        @   schedAdapter.schedOut[a] -> Fram.spiDriver.schedIn
-        @   schedAdapter.schedOut[b] -> Fram.framDriver.schedIn   (a < b)
+        @   cycler.cycleOut -> Fram.spiDriver.activeIn
+        @   cycler.cycleOut -> Fram.framDriver.activeIn   (SPI host listed first)
         connections Fram {
             framDriver.spiWriteReadOut -> spiDriver.SpiWriteRead[Fram.SubtopologyConfig.SPI_SLOT]
             spiDriver.SpiWriteReadComplete[Fram.SubtopologyConfig.SPI_SLOT] -> framDriver.spiReplyIn

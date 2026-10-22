@@ -153,7 +153,7 @@ void SpiDriver ::SpiWriteRead_handler(FwIndexType portNum, Fw::Buffer& writeBuff
         true, false, Samd21::Dma::AddressIncrementStepSize::SIZE_1, Samd21::Dma::StepSelection::SOURCE);
 }
 
-void SpiDriver ::schedIn_handler(FwIndexType portNum, U32 context) {
+bool SpiDriver ::activeIn_handler(FwIndexType portNum, U32 context) {
     for (FwIndexType slot = 0; slot < NUM_SPIWRITEREAD_INPUT_PORTS; slot++) {
         PendingReply reply;
         {
@@ -172,6 +172,7 @@ void SpiDriver ::schedIn_handler(FwIndexType portNum, U32 context) {
             this->SpiWriteReadComplete_out(slot, write, read, reply.status);
         }
     }
+    return false;
 }
 
 void SpiDriver ::dmaReplyIn_handler(FwIndexType portNum, const Samd21::Dma::Reply& reply) {

@@ -8,7 +8,7 @@ asynchronous completion.
 `Samd21::SpiDriver` implements the F Prime `Drv.AsyncGuardedSpi` interface:
 `Drv.AsyncSpiCfg.SpiDriverPorts` request ports (`SpiWriteRead`, one per attached device /
 chip select) with matching `SpiWriteReadComplete` completion ports, delivered in main
-context from `schedIn`. A request clocks one full-duplex frame — the write and
+context from `activeIn`. A request clocks one full-duplex frame — the write and
 read buffers must be the same length — using two `Samd21.DmaDriver` channels (MISO
 armed first, then MOSI, which starts the clock). The completion is reported when
 both DMA channels have finished.
@@ -50,8 +50,8 @@ selects on `FPRIME_PLATFORM`.
 | Kind | Name | Type | Notes |
 | ---- | ---- | ---- | ----- |
 | guarded input | `SpiWriteRead[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.SpiWriteReadRequest` | from `Drv.AsyncGuardedSpi`; index = chip-select slot |
-| output | `SpiWriteReadComplete[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.SpiWriteReadCallback` | **main context**, from `schedIn`; exactly one per request |
-| sync input | `schedIn` | `Svc.Sched` | **required**: delivers latched completions and refusals |
+| output | `SpiWriteReadComplete[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.SpiWriteReadCallback` | **main context**, from `activeIn`; exactly one per request |
+| sync input | `activeIn` | `Svc.ActiveSched` | **required**: delivers latched completions and refusals; returns false |
 | output | `dmaTransactionOut[DmaChannel.N]` | `Dma.Transaction` | `MOSI`, `MISO` |
 | output | `dmaTransactionAbortOut[DmaChannel.N]` | `Fw.Signal` | abort a stream after a receive overrun; **ISR context** |
 | sync input | `dmaReplyIn[DmaChannel.N]` | `Dma.TransactionReply` | **ISR context**: latches only |
@@ -80,13 +80,12 @@ SpiWriteRead[p] ─▶ unconfigured? ─▶ latch (p, SPI_CONFIG_ERR)
                    else: CS[p] LOW (sw) → DMA MISO (DATA → read) → DMA MOSI (write → DATA)
    (ISR) dmaReplyIn[MISO], dmaReplyIn[MOSI] in either order; both done → CS[p] HIGH → latch (p, SPI_OK)
    (ISR) SERCOM ERROR/BUFOVF → abort outstanding stream(s) → CS[p] HIGH → latch (p, SPI_OTHER_ERR)
-schedIn ─▶ for every slot with a latched reply (copied and cleared under CriticalSection):
+activeIn ─▶ for every slot with a latched reply (copied and cleared under CriticalSection):
            SpiWriteReadComplete[p](write, read, status)            main context
 ```
 
 Nothing is delivered from an ISR or from inside the request call: the ISR paths and the
-refusals only write the slot's pending record; `schedIn` (one pass per cycler turn through
-`Svc.PassiveSchedAdapter`, or a rate group) emits the callbacks with interrupts enabled, so a
+refusals only write the slot's pending record; `activeIn` (one pass per `Svc.PassiveCycler` turn) emits the callbacks with interrupts enabled, so a
 client may start its next transfer from inside the callback. A slot holds one pending reply:
 a client must wait for its completion before issuing again on the same slot (asserted, as a
 software protocol error). Stray DMA replies (nothing in flight, duplicate channel, unknown
@@ -104,7 +103,7 @@ outstanding stream(s) through `dmaTransactionAbortOut` (the DMA driver clears th
 channel's pending flags and raises no reply), acknowledges the overflow (bounded wait for
 `TXC` so the character still in the shifter cannot land after the drain, write-1-clear
 `BUFOVF`, drain `DATA`, clear `TXC`/`ERROR`), deasserts the software chip select and latches
-`SPI_OTHER_ERR` with the caller's buffers for the next `schedIn`. The SERCOM and DMAC
+`SPI_OTHER_ERR` with the caller's buffers for the next `activeIn`. The SERCOM and DMAC
 interrupts share the lowest NVIC priority, so neither handler preempts the other inside the
 driver.
 
@@ -136,10 +135,10 @@ channels, a `Samd21.GpioDriver` chip select, and the `configComponents` phase.
 ## 5. Unit tests
 
 `test/ut/` runs natively against the stub HAL (17 tests): configuration in both chip-select
-modes, reconfigure assert, request before configure (`SPI_CONFIG_ERR` via `schedIn`), nominal
+modes, reconfigure assert, request before configure (`SPI_CONFIG_ERR` via `activeIn`), nominal
 transactions in both DMA completion orders on every slot, busy refusal on another slot
-(`SPI_BUSY_ERR`, delivered by `schedIn`, re-request on the slot asserts), hardware chip
-select, size mismatch, stray/duplicate/late DMA replies ignored, `schedIn` with nothing
+(`SPI_BUSY_ERR`, delivered by `activeIn`, re-request on the slot asserts), hardware chip
+select, size mismatch, stray/duplicate/late DMA replies ignored, `activeIn` with nothing
 pending, `setBaudRate` (idle, before configure, while busy), BAUD boundaries and overflow,
 500 randomized transactions, and the receive-overrun path (both streams outstanding, one
 stream outstanding, spurious interrupt, overrun while idle, recovery on every slot and in

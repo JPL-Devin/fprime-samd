@@ -120,15 +120,16 @@ class SpiDriver final : public SpiDriverComponentBase {
 
     //! Handler implementation for SpiWriteRead (Drv.AsyncGuardedSpi). Starts the transfer
     //! or latches a refusal (SPI_BUSY_ERR, SPI_CONFIG_ERR); the outcome always arrives on
-    //! SpiWriteReadComplete from schedIn.
+    //! SpiWriteReadComplete from activeIn.
     void SpiWriteRead_handler(FwIndexType portNum,  //!< The port number
                               Fw::Buffer& writeBuffer,
                               Fw::Buffer& readBuffer) override;
 
-    //! Handler implementation for schedIn: delivers every latched reply (main context)
-    void schedIn_handler(FwIndexType portNum,  //!< The port number
-                         U32 context           //!< The call order
-                         ) override;
+    //! Handler implementation for activeIn: delivers every latched reply (main context).
+    //! Returns false (no further work this cycle).
+    bool activeIn_handler(FwIndexType portNum,  //!< The port number
+                          U32 context           //!< The call order
+                          ) override;
 
     //! Handler implementation for dmaReplyIn
     //!
@@ -153,7 +154,7 @@ class SpiDriver final : public SpiDriverComponentBase {
     //! Release the chip select of the transfer in flight (software chip select only)
     void deassertChipSelect();
 
-    //! Latch a reply for `portNum` to be delivered by the next schedIn. Asserts when that
+    //! Latch a reply for `portNum` to be delivered by the next activeIn. Asserts when that
     //! slot already holds an undelivered reply (a client must wait for its completion
     //! before issuing the next request on the same slot).
     void latchReply(FwIndexType portNum,
@@ -183,8 +184,8 @@ class SpiDriver final : public SpiDriverComponentBase {
 
     bool m_hardware_chip_select;
 
-    //! One completion waiting for schedIn, per slot. Written by the ISR paths (transfer
-    //! done, receive overrun) and by refused requests; read and cleared by schedIn under a
+    //! One completion waiting for activeIn, per slot. Written by the ISR paths (transfer
+    //! done, receive overrun) and by refused requests; read and cleared by activeIn under a
     //! critical section.
     struct PendingReply {
         Samd21::ThinBuffer write;

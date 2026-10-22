@@ -108,7 +108,7 @@ void SpiDriverTester ::testConfigureTwice() {
 
 void SpiDriverTester ::testRequestBeforeConfigure() {
     // REQUIREMENT(SPI-REQ-001): a request before configure() touches no hardware and is refused
-    //                            with SPI_CONFIG_ERR through the completion port, from schedIn
+    //                            with SPI_CONFIG_ERR through the completion port, from activeIn
     this->clearAll();
     this->m_writeBuffer[0].set(this->m_writeData[0], 4);
     this->m_readBuffer[0].set(this->m_readData[0], 4);
@@ -133,7 +133,7 @@ void SpiDriverTester ::testTransaction() {
 
 void SpiDriverTester ::testBusy() {
     // REQUIREMENT(SPI-XFER-003): one transaction at a time; an overlapping request on another slot is
-    //                            refused with SPI_BUSY_ERR (delivered from schedIn, never re-entrantly)
+    //                            refused with SPI_BUSY_ERR (delivered from activeIn, never re-entrantly)
     //                            and generates no DMA or chip select traffic; the first transfer is unaffected
     this->configure(SpiDriver::HardwareChipSelect::DISABLED);
     this->startTransaction(0, 8);
@@ -149,7 +149,7 @@ void SpiDriverTester ::testBusy() {
     this->invoke_to_SpiWriteRead(1, this->m_writeBuffer[1], this->m_readBuffer[1]);
     ASSERT_DEATH_IF_SUPPORTED(this->invoke_to_SpiWriteRead(1, this->m_writeBuffer[1], this->m_readBuffer[1]), "");
     this->clearAll();
-    this->invoke_to_schedIn(0, 0);
+    this->invoke_to_activeIn(0, 0);
     this->clearAll();
 
     // The original transfer completes normally afterwards
@@ -180,7 +180,7 @@ void SpiDriverTester ::testUnexpectedDmaReply() {
     this->clearAll();
     this->completeDma(SpiDriver_DmaChannel::MISO);
     this->completeDma(SpiDriver_DmaChannel::MOSI);
-    this->invoke_to_schedIn(0, 0);
+    this->invoke_to_activeIn(0, 0);
     ASSERT_from_SpiWriteReadComplete_SIZE(0);
     ASSERT_from_chipSelectGpioOut_SIZE(0);
 
@@ -188,7 +188,7 @@ void SpiDriverTester ::testUnexpectedDmaReply() {
     this->clearAll();
     this->completeDma(SpiDriver_DmaChannel::MISO);
     this->completeDma(SpiDriver_DmaChannel::MISO);
-    this->invoke_to_schedIn(0, 0);
+    this->invoke_to_activeIn(0, 0);
     ASSERT_from_SpiWriteReadComplete_SIZE(0);
     this->completeDma(SpiDriver_DmaChannel::MOSI);
     this->assertChipSelect(0, 0, Fw::Logic::HIGH);
@@ -295,7 +295,7 @@ void SpiDriverTester ::testReceiveOverrunAfterTxComplete() {
     // A late MISO completion after the abort (the DMA driver normally clears it) is ignored
     this->clearAll();
     this->completeDma(SpiDriver_DmaChannel::MISO);
-    this->invoke_to_schedIn(0, 0);
+    this->invoke_to_activeIn(0, 0);
     ASSERT_from_SpiWriteReadComplete_SIZE(0);
     ASSERT_from_chipSelectGpioOut_SIZE(0);
 
@@ -360,12 +360,12 @@ void SpiDriverTester ::testSetBaudRate() {
 }
 
 void SpiDriverTester ::testSchedIdle() {
-    // REQUIREMENT(SPI-XFER-006): schedIn with nothing latched emits nothing, before and after configure()
-    this->invoke_to_schedIn(0, 0);
+    // REQUIREMENT(SPI-XFER-006): activeIn with nothing latched emits nothing, before and after configure()
+    this->invoke_to_activeIn(0, 0);
     ASSERT_from_SpiWriteReadComplete_SIZE(0);
     this->configure(SpiDriver::HardwareChipSelect::DISABLED);
-    this->invoke_to_schedIn(0, 0);
-    this->invoke_to_schedIn(0, 1);
+    this->invoke_to_activeIn(0, 0);
+    this->invoke_to_activeIn(0, 1);
     ASSERT_from_SpiWriteReadComplete_SIZE(0);
     ASSERT_from_chipSelectGpioOut_SIZE(0);
 }
@@ -506,9 +506,9 @@ void SpiDriverTester ::assertChipSelect(FwSizeType index, FwIndexType port, Fw::
 }
 
 void SpiDriverTester ::assertReply(FwIndexType port, Drv::SpiStatus::T status) {
-    // Replies are latched (ISR or refusal) and delivered only by schedIn, in main context
+    // Replies are latched (ISR or refusal) and delivered only by activeIn, in main context
     ASSERT_from_SpiWriteReadComplete_SIZE(0);
-    this->invoke_to_schedIn(0, 0);
+    this->invoke_to_activeIn(0, 0);
     ASSERT_from_SpiWriteReadComplete_SIZE(1);
     ASSERT_EQ(this->m_replyPorts[0], port);
     const FromPortEntry_SpiWriteReadComplete& entry = this->fromPortHistory_SpiWriteReadComplete->at(0);

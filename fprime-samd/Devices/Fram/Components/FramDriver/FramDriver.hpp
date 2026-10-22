@@ -31,7 +31,7 @@ class FramDriver final : public FramDriverComponentBase {
   private:
     //! Transaction state. Exactly one transfer is on the bus in any *_IN_FLIGHT state.
     enum class State : U8 {
-        STARTUP,          //!< Before the first schedIn: nothing has been clocked
+        STARTUP,          //!< Before the first activeIn: nothing has been clocked
         ID_IN_FLIGHT,     //!< Startup RDID on the bus
         SR_IN_FLIGHT,     //!< Startup RDSR on the bus
         IDLE,             //!< Startup done, no client transaction in flight
@@ -50,7 +50,7 @@ class FramDriver final : public FramDriverComponentBase {
                             Fw::Buffer& writeBuffer,
                             Fw::Buffer& readBuffer,
                             const Drv::SpiStatus& status) override;
-    void schedIn_handler(FwIndexType portNum, U32 context) override;
+    bool activeIn_handler(FwIndexType portNum, U32 context) override;
 
     // ----------------------------------------------------------------------
     // Helpers

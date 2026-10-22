@@ -22,7 +22,7 @@
 | REQ-FRAM-015 | A failed startup read shall log `FramDeviceIdReadFailed` or `FramStatusReadFailed` and not block the other. | Unit test |
 | REQ-FRAM-016 | An ID mismatch or failed startup read shall not prevent servicing client requests. | Unit test |
 | REQ-FRAM-017 | The FramDriver shall issue only READ, WRITE with WREN, RDSR and RDID transactions. | Unit test; integration test |
-| REQ-FRAM-018 | The FramDriver shall issue no transaction before its first `schedIn` call. | Unit test |
+| REQ-FRAM-018 | The FramDriver shall issue no transaction before its first `activeIn` call. | Unit test |
 | REQ-FRAM-019 | The FramDriver shall accept a request issued from within a completion callback. | Unit test |
 | REQ-FRAM-021 | The FramDriver shall allocate nothing after construction; its static footprint shall not exceed 640 bytes. | Inspection (map file) |
 | REQ-FRAM-022 | After reset or power cycle, ranges whose write completed `OK` shall read back unchanged. | Integration test |
@@ -40,7 +40,7 @@
               read[N] : Fram.Request ──▶ ■                              ■ ──▶ readComplete[N] : Fram.Reply
              write[N] : Fram.Request ──▶ ■        Fram.FramDriver       ■ ──▶ writeComplete[N] : Fram.Reply
 spiReplyIn : Drv.SpiWriteReadCallback ──▶ ■  (passive; sync ports)      ■ ──▶ spiWriteReadOut : Drv.SpiWriteReadRequest
-                 schedIn : Svc.Sched ──▶ ■                              │
+                 activeIn : Svc.ActiveSched ─▶ ■                              │
                                    └──────────────────────────────────────┘
    N = Fram.Config.ClientPorts   special ports: eventOut, textEventOut, timeGetOut
 ```
@@ -53,8 +53,8 @@ spiReplyIn : Drv.SpiWriteReadCallback ──▶ ■  (passive; sync ports)      
 | `readComplete[N]` | output, `match … with read` | `Fram.Reply` | Completion (`OK`/`SPI_ERROR`) on the issuing index (REQ-005) |
 | `writeComplete[N]` | output, `match … with write` | `Fram.Reply` | Completion (`OK`/`SPI_ERROR`) on the issuing index (REQ-005) |
 | `spiWriteReadOut` | output | `Drv.SpiWriteReadRequest` | One full-duplex transfer = one chip-select cycle; every request is answered on `spiReplyIn` |
-| `spiReplyIn` | sync input (main context, from the SPI host's `schedIn`) | `Drv.SpiWriteReadCallback` | Transfer outcome; drives the next phase or the completion (REQ-011, -013) |
-| `schedIn` | sync input (main; required) | `Svc.Sched` | Issues the startup RDID / RDSR once (REQ-018, -024) |
+| `spiReplyIn` | sync input (main context, from the SPI host's `activeIn`) | `Drv.SpiWriteReadCallback` | Transfer outcome; drives the next phase or the completion (REQ-011, -013) |
+| `activeIn` | sync input (main; required) | `Svc.ActiveSched` | Issues the startup RDID / RDSR once; returns false (REQ-018, -024) |
 SPI ports are the `Drv.AsyncGuardedSpi` client pair (nasa/fprime #6237, merged; `Samd21.SpiDriver` implements it); no commands, telemetry channels or parameters.
 ### 2.3 Events
 | Event | Severity | Arguments | When |
@@ -88,26 +88,25 @@ module Fram { module SubtopologyConfig {
 constexpr Samd21::SercomKind::T SERCOM = Samd21::SercomKind::SERCOM_1;
 constexpr U32 BAUD_RATE_KHZ = 4000;   // with CLOCK_POLARITY IdleLow, CLOCK_PHASE SampleOnLeadingSck (mode 0)
 ```
-The deployment schedules both drivers through the passive-cycler → `Svc.Sched` adapter (fprime-samd PR), SPI host first so a completion and the phase it triggers land in one cycle, and connects each client pair unindexed — `match` keeps request and completion on one index.
+The deployment connects both drivers to `Svc.PassiveCycler.cycleOut`, SPI host first so a completion and the phase it triggers land in one cycle, and connects each client pair unindexed — `match` keeps request and completion on one index.
 ```fpp
-cycler.cycleOut -> schedAdapter.activeIn            # adapter returns false: one pass per cycle
-schedAdapter.schedOut[0] -> Fram.spiDriver.schedIn  # SpiDriver leaves ISR context here
-schedAdapter.schedOut[1] -> Fram.framDriver.schedIn
+cycler.cycleOut -> Fram.spiDriver.activeIn   # SpiDriver leaves ISR context here
+cycler.cycleOut -> Fram.framDriver.activeIn  # listed after, so it runs after
 client.framReadOut -> Fram.framDriver.read          Fram.framDriver.readComplete -> client.readCompleteIn
 ```
 ### 2.5 Behavior
-On its first `schedIn` the driver issues RDID (9Fh), on that reply issues RDSR (05h), and on that reply logs `FramStartupComplete(deviceIdMatch, writeProtected, statusRegister)` once — preceded by `FramDeviceIdMismatch`, `FramDeviceIdReadFailed` or `FramStatusReadFailed` when applicable — and starts accepting requests; until then every request returns `BUSY`. A request is checked in the order null buffer (assert, caller fault), `INVALID_SIZE` (0 or above `MaxTransfer`), `OUT_OF_RANGE` (offset + size above `DEVICE_SIZE`), `BUSY` (transaction in flight); a rejected request gets no completion, an accepted one records index, offset and buffer, issues READ 03h (or WREN 06h for a write) as one chip-select cycle through `spiWriteReadOut`, and returns `OK`. Every `spiReplyIn` — completion or refusal (`SPI_BUSY_ERR`, `SPI_CONFIG_ERR`) — arrives in main context from the SPI host's `schedIn`, never re-entrantly, so the driver acts on it directly: after WREN it issues WRITE 02h, after READ it copies the received bytes into the client buffer, after any failed transfer it logs `FramSpiError` and substitutes `SPI_ERROR`, then returns to `IDLE` and invokes `readComplete[i]` / `writeComplete[i]` with offset, buffer and status on the issuing index. A reply that does not name the in-flight staging buffers, or arrives while idle, is ignored — nothing completes, nothing asserts, the next request is served. Because the state is `IDLE` before the completion call, a client may issue its next request from inside the callback; with no ISR path left in the component, no atomics or critical sections are needed.
+On its first `activeIn` the driver issues RDID (9Fh), on that reply issues RDSR (05h), and on that reply logs `FramStartupComplete(deviceIdMatch, writeProtected, statusRegister)` once — preceded by `FramDeviceIdMismatch`, `FramDeviceIdReadFailed` or `FramStatusReadFailed` when applicable — and starts accepting requests; until then every request returns `BUSY`. A request is checked in the order null buffer (assert, caller fault), `INVALID_SIZE` (0 or above `MaxTransfer`), `OUT_OF_RANGE` (offset + size above `DEVICE_SIZE`), `BUSY` (transaction in flight); a rejected request gets no completion, an accepted one records index, offset and buffer, issues READ 03h (or WREN 06h for a write) as one chip-select cycle through `spiWriteReadOut`, and returns `OK`. Every `spiReplyIn` — completion or refusal (`SPI_BUSY_ERR`, `SPI_CONFIG_ERR`) — arrives in main context from the SPI host's `activeIn`, never re-entrantly, so the driver acts on it directly: after WREN it issues WRITE 02h, after READ it copies the received bytes into the client buffer, after any failed transfer it logs `FramSpiError` and substitutes `SPI_ERROR`, then returns to `IDLE` and invokes `readComplete[i]` / `writeComplete[i]` with offset, buffer and status on the issuing index. A reply that does not name the in-flight staging buffers, or arrives while idle, is ignored — nothing completes, nothing asserts, the next request is served. Because the state is `IDLE` before the completion call, a client may issue its next request from inside the callback; with no ISR path left in the component, no atomics or critical sections are needed.
 ```mermaid
 sequenceDiagram
-    participant S as SpiDriver (Drv.AsyncGuardedSpi; DMAC ISR latches, schedIn replies)
-    participant Y as schedAdapter (main)
+    participant S as SpiDriver (Drv.AsyncGuardedSpi; DMAC ISR latches, activeIn replies)
+    participant Y as cycler (Svc.PassiveCycler, main)
     Client->>FramDriver: write[i](offset, buffer)
     FramDriver->>S: spiWriteReadOut(WREN)   [WREN_IN_FLIGHT]
     FramDriver-->>Client: return OK
-    Y->>S: schedIn   (DMA done, latched in the ISR)
+    Y->>S: activeIn   (DMA done, latched in the ISR)
     S->>FramDriver: spiReplyIn(SPI_OK)
     FramDriver->>S: spiWriteReadOut(WRITE 02h A2 A1 A0 data)   [WRITE_IN_FLIGHT]
-    Y->>S: schedIn
+    Y->>S: activeIn
     S->>FramDriver: spiReplyIn(status)   [→ IDLE]
     FramDriver->>Client: writeComplete[i](offset, buffer, OK | SPI_ERROR)
     Client->>FramDriver: read[i](…) from the callback → OK (REQ-019)
@@ -126,7 +125,7 @@ sequenceDiagram
 | UT-07 | size 0 and 129 return INVALID_SIZE, nothing issued; size 128 accepted | REQ-FRAM-007 |
 | UT-08 | offset + size > DEVICE_SIZE returns OUT_OF_RANGE; == DEVICE_SIZE accepted with address `03 FF 80` | REQ-FRAM-008 |
 | UT-09 | second and third requests return BUSY; only the first completes with its own offset/buffer | REQ-FRAM-009 |
-| UT-10 | rejected requests never produce a completion over 5 further `schedIn` calls | REQ-FRAM-010 |
+| UT-10 | rejected requests never produce a completion over 5 further `activeIn` calls | REQ-FRAM-010 |
 | UT-11 | reply errors (incl. SPI_BUSY_ERR refusal) on READ/WREN/WRITE → `FramSpiError`, SPI_ERROR; next request OK | REQ-FRAM-011 |
 | UT-12 | null buffer on read and on write fires the assert hook; nothing issued | REQ-FRAM-012 |
 | UT-13 | reply while idle, with foreign buffers, or duplicated: no completion, no assert, next request OK | REQ-FRAM-013 |
@@ -134,7 +133,7 @@ sequenceDiagram
 | UT-15 | RDID error → `FramDeviceIdReadFailed`, RDSR still issued; RDSR error → `FramStatusReadFailed` | REQ-FRAM-015 |
 | UT-16 | after mismatch or failed startup reads a client read completes OK | REQ-FRAM-016 |
 | UT-17 | every captured TX opcode ∈ {03, 02, 06, 05, 9F} | REQ-FRAM-017 |
-| UT-18 | request before the first `schedIn` returns BUSY; no transfer until the first `schedIn` | REQ-FRAM-018 |
+| UT-18 | request before the first `activeIn` returns BUSY; no transfer until the first `activeIn` | REQ-FRAM-018 |
 | UT-19 | write issued from inside `readComplete` is accepted; original completion arguments intact | REQ-FRAM-019 |
 | UT-21 | `static_assert(sizeof(FramDriver) + file-scope objects <= 640)`; failing `operator new` links | REQ-FRAM-021 |
 | UT-24 | reads before the RDID and RDSR replies return BUSY; accepted after startup | REQ-FRAM-024 |

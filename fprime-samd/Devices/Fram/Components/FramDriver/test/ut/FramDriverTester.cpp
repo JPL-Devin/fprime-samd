@@ -84,13 +84,13 @@ void FramDriverTester ::testWrite() {
 
 void FramDriverTester ::testAcceptThenComplete() {
     // UT-04: request returns OK with one transfer issued; completion only after the reply
-    // UT-10: rejected requests never produce a completion over further schedIn calls
+    // UT-10: rejected requests never produce a completion over further activeIn calls
     this->startup();
     const U32 before = this->m_spiCount;
     ASSERT_EQ(this->read(1, 0x100, 4), Fram::Status::OK);
     ASSERT_EQ(this->m_spiCount, before + 1);
     for (U32 i = 0; i < 5; i++) {
-        this->invoke_to_schedIn(0, i);
+        this->invoke_to_activeIn(0, i);
     }
     ASSERT_from_readComplete_SIZE(0);
     ASSERT_EQ(this->read(0, 0, 4), Fram::Status::BUSY);
@@ -99,7 +99,7 @@ void FramDriverTester ::testAcceptThenComplete() {
     U8 d[4] = {9, 9, 9, 9};
     this->finishRead(1, 0x100, 4, d);
     for (U32 i = 0; i < 5; i++) {
-        this->invoke_to_schedIn(0, i);
+        this->invoke_to_activeIn(0, i);
     }
     ASSERT_from_readComplete_SIZE(1);
     ASSERT_from_writeComplete_SIZE(0);
@@ -252,9 +252,9 @@ void FramDriverTester ::testDeviceId() {
     ASSERT_EVENTS_FramDeviceIdMismatch(0, expected.c_str(), got.c_str());
     ASSERT_EVENTS_FramStartupComplete(0, false, false, 0x00);
     U32 rdid = 0;
-    // exactly one RDID so far, and none after further schedIn calls
+    // exactly one RDID so far, and none after further activeIn calls
     for (U32 i = 0; i < 3; i++) {
-        this->invoke_to_schedIn(0, i);
+        this->invoke_to_activeIn(0, i);
     }
     for (U32 i = 0; i < this->m_spiCount && i < MAX_HISTORY_SIZE; i++) {
         if (this->m_opcodes[i] == RDID) {
@@ -293,7 +293,7 @@ void FramDriverTester ::testStartupReadFailures() {
     ASSERT_EQ(sr.eventHistory_FramStartupComplete->at(0).writeProtected, false);
     ASSERT_EQ(sr.eventHistory_FramStartupComplete->at(0).statusRegister, 0xFF);
     for (U32 i = 0; i < 3; i++) {
-        sr.invoke_to_schedIn(0, i);
+        sr.invoke_to_activeIn(0, i);
     }
     ASSERT_EQ(sr.eventHistory_FramStartupComplete->size(), 1u);
 }
@@ -314,12 +314,12 @@ void FramDriverTester ::testOpcodes() {
 }
 
 void FramDriverTester ::testBeforeFirstSched() {
-    // UT-18: request before the first schedIn returns BUSY; no transfer until the first schedIn
+    // UT-18: request before the first activeIn returns BUSY; no transfer until the first activeIn
     // UT-24: reads before the RDID and RDSR replies return BUSY; accepted after startup
     ASSERT_EQ(this->read(0, 0, 1), Fram::Status::BUSY);
     ASSERT_EQ(this->write(1, 0, 1), Fram::Status::BUSY);
     ASSERT_EQ(this->m_spiCount, 0u);
-    this->invoke_to_schedIn(0, 0);
+    this->invoke_to_activeIn(0, 0);
     ASSERT_EQ(this->m_spiCount, 1u);
     ASSERT_EQ(this->lastTx()[0], RDID);
     ASSERT_EQ(this->read(0, 0, 1), Fram::Status::BUSY);
@@ -501,7 +501,7 @@ void FramDriverTester ::from_writeComplete_handler(FwIndexType portNum,
 // ----------------------------------------------------------------------
 
 void FramDriverTester ::startup(Drv::SpiStatus::T idStatus, const U8* id, Drv::SpiStatus::T srStatus, U8 sr) {
-    this->invoke_to_schedIn(0, 0);
+    this->invoke_to_activeIn(0, 0);
     ASSERT_EQ(this->m_spiCount, 1u);
     ASSERT_EQ(this->lastTx()[0], RDID);
     ASSERT_EQ(this->lastLen(), 1u + Fram::DEVICE_ID_SIZE);

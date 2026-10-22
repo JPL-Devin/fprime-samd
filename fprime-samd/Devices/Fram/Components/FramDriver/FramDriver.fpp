@@ -3,7 +3,7 @@ module Fram {
     @ immediately (OK = accepted, else a rejection status) and an accepted request completes
     @ asynchronously through the SPI host's Drv.AsyncGuardedSpi completion, which the host
     @ delivers in main context; the completion is forwarded on the matching client index.
-    @ One transaction is in flight at a time. Client requests, spiReplyIn and schedIn must all
+    @ One transaction is in flight at a time. Client requests, spiReplyIn and activeIn must all
     @ run in the same execution context (no mutual exclusion inside).
     passive component FramDriver {
         # ----------------------------------------------------------------------
@@ -40,9 +40,9 @@ module Fram {
         # Scheduling
         # ----------------------------------------------------------------------
         @ REQUIRED CONNECTION. Issues the startup transactions (RDID, then RDSR) on the first
-        @ call; nothing is clocked before it. Connect to the deployment's scheduler
-        @ (Svc.PassiveSchedAdapter behind Svc.PassiveCycler, or a rate group).
-        sync input port schedIn: Svc.Sched
+        @ call; nothing is clocked before it. Connect to Svc.PassiveCycler (cycleOut) at a
+        @ higher index than the SPI host's activeIn. Always returns false (no more work).
+        sync input port activeIn: Svc.ActiveSched
 
         # ----------------------------------------------------------------------
         # Events (REQ-FRAM-011, -014, -015, -026, -028). No commands, telemetry or parameters:

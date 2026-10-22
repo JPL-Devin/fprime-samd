@@ -12,14 +12,15 @@ module Samd21 {
         @ Asynchronous SPI contract: SpiWriteRead[slot] starts one full-duplex transfer; every
         @ request is answered with exactly one SpiWriteReadComplete[slot] (SPI_OK, SPI_OTHER_ERR
         @ on a receive overrun, SPI_BUSY_ERR while another transfer is in flight, SPI_CONFIG_ERR
-        @ before configure()). Completions are delivered from schedIn, never from an ISR and
+        @ before configure()). Completions are delivered from activeIn, never from an ISR and
         @ never from inside the request call.
         import Drv.AsyncGuardedSpi
 
         @ REQUIRED CONNECTION. Main-context delivery of the completions latched by the DMAC
         @ and SERCOM interrupts (and of refused requests). Connect to the deployment's
-        @ scheduler (Svc.PassiveCycler through Svc.PassiveSchedAdapter, or a rate group).
-        sync input port schedIn: Svc.Sched
+        @ Svc.PassiveCycler (cycleOut), at a lower index than the components that consume the
+        @ completions. Always returns false: delivering replies leaves no work for this cycle.
+        sync input port activeIn: Svc.ActiveSched
 
         @ Port to send a DMA transaction to the DMA driver
         output port dmaTransactionOut: [DmaChannel.N] Dma.Transaction
