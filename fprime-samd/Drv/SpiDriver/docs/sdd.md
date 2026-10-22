@@ -129,8 +129,10 @@ transfer at a time per driver (no queueing across slots); ≤ 65535 bytes per tr
 
 ## 4. Integration
 
-See `fprime-samd/Devices/Fram/Subtopology/Subtopology.fpp` for a complete example: two DMA
-channels, a `Samd21.GpioDriver` chip select, and the `configComponents` phase.
+A deployment supplies two DMA channels (`dmaTransactionOut`/`dmaReplyIn`/`dmaTransactionAbortOut`
+per channel), optionally a `Samd21.GpioDriver` chip select, `cycler.cycleOut -> spiDriver.activeIn`
+before the consumers of its completions, and calls `configure()` in the `configComponents` phase.
+The CY15B102QN F-RAM driver (separate PR) is the reference consumer.
 
 ## 5. Unit tests
 
