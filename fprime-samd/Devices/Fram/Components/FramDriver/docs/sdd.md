@@ -1,195 +1,163 @@
-# Fram::FramDriver
+# Fram::FramDriver — Software Design Document
 
-Protocol driver for the Infineon CY15B102QN / CY15V102QN 2 Mbit SPI F-RAM.
+`Fram.FramDriver` is a passive F´ component that gives client components read and write access to an Infineon CY15B102QN 2 Mbit (256 KiB) serial F-RAM over SPI. A client calls the synchronous `read` or `write` port with a byte offset and an `Fw.Buffer`; the driver clocks the transfer through an asynchronous SPI host and delivers the outcome later, in main context, on the completion port of the same index. At startup it reads the device ID and the write-protect bits once and reports them in one event. It allocates nothing after construction, creates no thread or queue, and never asserts on what the hardware returns.
 
-## 1. Introduction
+## 1. Requirements
 
-`Fram::FramDriver` turns a client's "read N bytes at offset" or "write N bytes at
-offset" request into the SPI frames the F-RAM understands, issues them through an
-asynchronous SPI host (`Samd21.SpiDriver`), and reports the outcome back to the
-client later, in main context. It is a passive component with no commands, events,
-telemetry or parameters: on a 16 KiB-RAM target every dictionary item costs
-flash and downlink, and the only thing the driver has to say is the status of the
-transaction, which travels on the reply port.
+| ID | Requirement | Verification |
+|---|---|---|
+| REQ-FRAM-001 | The FramDriver shall read `n` bytes at offset `o` into the request's buffer. | Unit test; integration test |
+| REQ-FRAM-002 | The FramDriver shall write the request buffer's `n` bytes to the F-RAM at offset `o`. | Unit test; integration test |
+| REQ-FRAM-003 | Every transaction shall comply with datasheet 002-19073 Rev. *O (opcode, address, data order, chip-select cycle). | Unit test (bytes vs datasheet); integration test |
+| REQ-FRAM-004 | Accepted requests shall return `OK` after issuing the first transfer; completions carry offset, buffer, status. | Unit test |
+| REQ-FRAM-005 | The FramDriver shall deliver completions on the index the request arrived on. | Unit test |
+| REQ-FRAM-007 | The FramDriver shall reject sizes of 0 or above `MaxTransfer` with `INVALID_SIZE`, issuing nothing. | Unit test |
+| REQ-FRAM-008 | The FramDriver shall reject `offset + size` beyond 262 144 bytes with `OUT_OF_RANGE`, issuing nothing. | Unit test |
+| REQ-FRAM-009 | The FramDriver shall reject requests arriving during a transaction with `BUSY`, issuing nothing. | Unit test |
+| REQ-FRAM-010 | Rejections shall be the request's return value; a rejected request receives no completion. | Unit test |
+| REQ-FRAM-011 | SPI host failures shall complete the transaction `SPI_ERROR` with `FramSpiError`; the next request is accepted. | Unit test |
+| REQ-FRAM-012 | The FramDriver shall `FW_ASSERT` on a request whose buffer data pointer is null. | Unit test |
+| REQ-FRAM-013 | Spurious or mismatched SPI completions shall be ignored: no completion, no assert, state unchanged. | Unit test |
+| REQ-FRAM-014 | At startup the FramDriver shall read the device ID once, logging `FramDeviceIdMismatch` on mismatch. | Unit test; integration test |
+| REQ-FRAM-015 | A failed startup read shall log `FramDeviceIdReadFailed` or `FramStatusReadFailed` and not block the other. | Unit test |
+| REQ-FRAM-016 | An ID mismatch or failed startup read shall not prevent servicing client requests. | Unit test |
+| REQ-FRAM-017 | The FramDriver shall issue only READ, WRITE with WREN, RDSR and RDID transactions. | Unit test; integration test |
+| REQ-FRAM-018 | The FramDriver shall issue no transaction before its first `schedIn` call. | Unit test |
+| REQ-FRAM-019 | The FramDriver shall accept a request issued from within a completion callback. | Unit test |
+| REQ-FRAM-021 | The FramDriver shall allocate nothing after construction; its static footprint shall not exceed 640 bytes. | Inspection (map file) |
+| REQ-FRAM-022 | After reset or power cycle, ranges whose write completed `OK` shall read back unchanged. | Integration test |
+| REQ-FRAM-023 | The FramDriver shall create no thread and no message queue. | Inspection |
+| REQ-FRAM-024 | Requests arriving before startup transactions complete shall be rejected `BUSY`, issuing nothing. | Unit test |
+| REQ-FRAM-025 | Rejection precedence shall be: null buffer (assert), `INVALID_SIZE`, `OUT_OF_RANGE`, `BUSY`. | Unit test |
+| REQ-FRAM-026 | At startup the FramDriver shall read the status register once and report BP1/BP0 as `writeProtected`. | Unit test; integration test |
+| REQ-FRAM-027 | The build shall fail for `MaxTransfer` of 0 or above `DEVICE_SIZE`, or `ClientPorts` of 0. | Inspection |
+| REQ-FRAM-028 | When startup transactions complete, the FramDriver shall log `FramStartupComplete` (ID match, write protect) once. | Unit test; integration test |
 
-The device needs no busy polling: an F-RAM write completes at bus speed, so a
-write is finished when its last byte has been clocked. What the protocol does
-need is a `WREN` (write enable) opcode in its **own** chip-select cycle before
-every `WRITE`, which is why a write is two SPI transactions.
-
-## 2. Requirements
-
-| Name | Description | Validation |
-| ---- | ----------- | ---------- |
-| REQ-FRAM-001 | The FramDriver shall accept a read request (offset, destination buffer) and read `buffer.size` bytes from the F-RAM at that offset using `READ` (03h) followed by three address bytes. | Unit Test, Hardware Test |
-| REQ-FRAM-002 | The FramDriver shall accept a write request (offset, source buffer) and write `buffer.size` bytes at that offset using `WREN` (06h) in its own chip-select cycle followed by `WRITE` (02h), three address bytes and the data. | Unit Test, Hardware Test |
-| REQ-FRAM-003 | The FramDriver shall complete every request asynchronously: the request port returns immediately and the completion is reported later on a reply port carrying the original offset, buffer and a status. | Unit Test |
-| REQ-FRAM-004 | The FramDriver shall deliver each reply on the reply port whose index equals the request port index. | Unit Test |
-| REQ-FRAM-005 | The FramDriver shall reject immediately, with no SPI traffic, any request with size 0, size greater than `Fram.Config.MaxTransfer`, or `offset + size` greater than `Fram.DEVICE_SIZE` (no address wrap). | Unit Test, Hardware Test |
-| REQ-FRAM-006 | The FramDriver shall service one transaction at a time and reject a request that arrives while one is in flight with `BUSY`. | Unit Test |
-| REQ-FRAM-007 | On a non-`SPI_OK` status from the SPI host in any phase the FramDriver shall abort the transaction (no `WRITE` after a failed `WREN`), reply `SPI_ERROR`, and return to idle. | Unit Test |
-| REQ-FRAM-008 | The FramDriver shall build SPI frames in statically allocated staging storage of `MaxTransfer + HEADER_SIZE` bytes for each of TX and RX, with no dynamic allocation. | Inspection, Unit Test |
-| REQ-FRAM-009 | On a completed read the FramDriver shall copy exactly `size` bytes, skipping the `HEADER_SIZE` header clocks, into the caller's buffer before replying. | Unit Test |
-| REQ-FRAM-010 | The FramDriver shall be a passive component with synchronous input ports and shall not block on hardware. | Inspection |
-| REQ-FRAM-011 | The FramDriver shall `FW_ASSERT` on an unexpected SPI reply: a reply while no SPI frame is in flight, or a reply carrying buffers other than its own staging buffers. | Unit Test |
-| REQ-FRAM-012 | The FramDriver shall deliver client replies from the main (non-ISR) context: the SPI completion is latched in the ISR and the reply is issued on the next `activeIn` tick. | Unit Test |
-| REQ-FRAM-013 | The FramDriver shall read the 9-byte device ID with `RDID` (9Fh) once at startup, after event reporting is available: from the first `activeIn` tick that finds the driver idle, never from `configure()` or the constructor. | Unit Test, Hardware Test |
-| REQ-FRAM-014 | The FramDriver shall compare the ID with `Fram::EXPECTED_DEVICE_ID` (`FramSubtopologyConfig`, default CY15B102QN) and emit `FramDeviceIdMismatch` (WARNING_HI, both IDs as hex) on any difference; no event on a match. A mismatch does not block reads or writes. | Unit Test, Hardware Test |
-| REQ-FRAM-015 | The ID read shall use the existing transaction machinery: the driver is `BUSY` to clients while it is in flight, the outcome is delivered in main context (REQ-FRAM-012), and an SPI failure takes the existing `SPI_ERROR` path, leaving the part unidentified with no event and no retry. | Unit Test |
-| REQ-FRAM-016 | REQ-FRAM-001..012 are unchanged by the ID read; it reuses the READ/WRITE staging buffers (10 bytes). | Unit Test |
-
-Status values: `OK`, `BUSY`, `OUT_OF_RANGE`, `TOO_LARGE`, `SPI_ERROR` (`Fram.Status`, see `Fram/Types/Types.fpp`).
-
-## 3. Design
-
-### 3.1 Overview
-
+## 2. Design
+### 2.1 Block diagram
 ```
-client ──read[i]/write[i]──▶ FramDriver ──spiWriteReadOut──▶ Samd21.SpiDriver ──▶ DMA
-client ◀─readComplete[i]/──  FramDriver ◀──spiReplyIn (ISR)── Samd21.SpiDriver ◀── DMA ISR
-          writeComplete[i]        ▲
-                       activeIn (Svc.PassiveCycler, main context)
+                                   ┌──────────────────────────────────────┐
+              read[N] : Fram.Request ──▶ ■                              ■ ──▶ readComplete[N] : Fram.Reply
+             write[N] : Fram.Request ──▶ ■        Fram.FramDriver       ■ ──▶ writeComplete[N] : Fram.Reply
+spiReplyIn : Drv.SpiWriteReadCallback ──▶ ■  (passive; sync ports)      ■ ──▶ spiWriteReadOut : Drv.SpiWriteReadRequest
+                 schedIn : Svc.Sched ──▶ ■                              │
+                                   └──────────────────────────────────────┘
+   N = Fram.Config.ClientPorts   special ports: eventOut, textEventOut, timeGetOut
 ```
 
-A request is validated, the frame is built in the TX staging buffer, and one
-full-duplex SPI transaction is issued. The SPI completion arrives in the DMAC
-interrupt. The ISR handler only latches the outcome (and, for a write, advances
-the state machine); the client reply is delivered on the next `activeIn` tick.
+### 2.2 Ports
+| Name | Kind | Type | Purpose |
+|---|---|---|---|
+| `read[N]` | sync input | `Fram.Request` → `Fram.Status` | Read `buffer.size` bytes at `offset`; returns `OK` or the rejection (REQ-001, -010) |
+| `write[N]` | sync input | `Fram.Request` → `Fram.Status` | Write `buffer.size` bytes at `offset`; returns `OK` or the rejection (REQ-002, -010) |
+| `readComplete[N]` | output, `match … with read` | `Fram.Reply` | Completion (`OK`/`SPI_ERROR`) on the issuing index (REQ-005) |
+| `writeComplete[N]` | output, `match … with write` | `Fram.Reply` | Completion (`OK`/`SPI_ERROR`) on the issuing index (REQ-005) |
+| `spiWriteReadOut` | output | `Drv.SpiWriteReadRequest` | One full-duplex transfer = one chip-select cycle; every request is answered on `spiReplyIn` |
+| `spiReplyIn` | sync input (main context, from the SPI host's `schedIn`) | `Drv.SpiWriteReadCallback` | Transfer outcome; drives the next phase or the completion (REQ-011, -013) |
+| `schedIn` | sync input (main; required) | `Svc.Sched` | Issues the startup RDID / RDSR once (REQ-018, -024) |
+SPI ports are the `Drv.AsyncGuardedSpi` client pair (nasa/fprime #6237, merged; `Samd21.SpiDriver` implements it); no commands, telemetry channels or parameters.
+### 2.3 Events
+| Event | Severity | Arguments | When |
+|---|---|---|---|
+| `FramSpiError` | WARNING_HI | `operation: Fram.Operation`, `spiStatus: Drv.SpiStatus`, `offset: U32`, `size: U32` | SPI host error on a client transfer; status `SPI_ERROR` (REQ-011) |
+| `FramDeviceIdMismatch` | WARNING_HI | `expected: string 24`, `got: string 24` (18 hex chars) | Startup RDID ≠ `EXPECTED_DEVICE_ID` (REQ-014) |
+| `FramDeviceIdReadFailed` | WARNING_LO | `spiStatus: Drv.SpiStatus` | Startup RDID transfer failed (REQ-015) |
+| `FramStatusReadFailed` | WARNING_LO | `spiStatus: Drv.SpiStatus` | Startup RDSR transfer failed (REQ-015) |
+| `FramStartupComplete` | ACTIVITY_LO | `deviceIdMatch: bool` (false if RDID failed), `writeProtected: bool` (BP1 or BP0 set), `statusRegister: U8` (0xFF if RDSR failed) | Both startup transactions done; requests accepted (REQ-026, -028) |
 
-### 3.2 Ports
-
-| Kind | Name | Type | Notes |
-| ---- | ---- | ---- | ----- |
-| sync input | `read[ClientPorts]` | `Fram.Request` | read `buffer.size` bytes at `offset` |
-| sync input | `write[ClientPorts]` | `Fram.Request` | write `buffer.size` bytes at `offset` |
-| output | `readComplete[ClientPorts]` | `Fram.Reply` | `match readComplete with read` |
-| output | `writeComplete[ClientPorts]` | `Fram.Reply` | `match writeComplete with write` |
-| output | `spiWriteReadOut` | `Samd21.SpiWriteRead` | one full-duplex frame; TX and RX buffers are the same length |
-| sync input | `spiReplyIn` | `Samd21.SpiReply` | **ISR context** |
-| sync input | `activeIn` | `Svc.ActiveSched` | **required connection** to the deployment's `Svc.PassiveCycler`; returns `true` when work was done |
-
-### 3.3 Configuration
-
-Compile time, `Fram/FramConfig/FramConfig.fpp` (project-overridable):
-
-| Constant | Default | Meaning |
-| -------- | ------- | ------- |
-| `Fram.Config.ClientPorts` | 2 | request/reply port pairs |
-| `Fram.Config.MaxTransfer` | 128 | largest single transfer; RAM cost `2 * (MaxTransfer + 4)` bytes |
-
-Device constants, `Fram/Types/Types.fpp`: `DEVICE_SIZE = 0x40000`, `ADDRESS_BYTES = 3`, `HEADER_SIZE = 4`.
-
-The driver has no runtime configuration. The SPI host it talks to is configured by
-`Fram.Subtopology` from `Fram/Subtopology/FramSubtopologyConfig/` (SERCOM, pins,
-baud, mode, chip-select slot) — see §4.
-
-### 3.4 Transaction behaviour
-
-Frames (all bytes MSB first; `A2 A1 A0` is the 18-bit address in three bytes):
-
+### 2.4 Configure
+`Fram.Config` (module `FramConfig`, project-overridable) sizes the driver: one request/reply index pair per client, and the largest single transfer, which sets the two static SPI staging buffers at `2 × (MaxTransfer + 4)` bytes — about 530 B of the 640 B footprint budget at the defaults; a two-segment SPI transfer (SPI-driver PR) removes the staging (REQ-021, -027).
+```fpp
+module Fram { module Config {
+    constant ClientPorts = 2      # client request/reply index pairs (> 0)
+    constant MaxTransfer = 128    # bytes per request, 1 ... DEVICE_SIZE
+} }
 ```
-READ  : TX [03h A2 A1 A0 00 … 00]   RX [-- -- -- -- d0 … dN-1]
-WREN  : TX [06h]                    RX [--]
-WRITE : TX [02h A2 A1 A0 d0 … dN-1] RX [-- … --]
+`FramDeviceIdConfig.hpp` (same module) holds the RDID the startup check expects, in MISO byte order; the 3.0 V CY15V102QN ends `... 04` (REQ-014).
+```cpp
+constexpr U8 EXPECTED_DEVICE_ID[9] = {0x00, 0x2A, 0xC2, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F};  // CY15B102QN
+```
+`Fram.Subtopology` instantiates `framDriver` and its `spiDriver`; `FramSubtopologyConfig` (overridable) sets the ids and the SPI host (4 MHz, mode 0, MSB first on SERCOM1 PA16/PA17/PA19). Device geometry (`Fram.DEVICE_SIZE` 0x40000, 3 address bytes, 9-byte ID, BP mask 0x0C) is fixed, not configured.
+```fpp
+module Fram { module SubtopologyConfig {
+    constant BASE_ID  = 0xDD00    # framDriver events at BASE_ID + 0 ... 4; spiDriver at + 0x100
+    constant SPI_SLOT = 0         # spiDriver chip-select slot the F-RAM hangs off
+} }
+```
+```cpp
+constexpr Samd21::SercomKind::T SERCOM = Samd21::SercomKind::SERCOM_1;
+constexpr U32 BAUD_RATE_KHZ = 4000;   // with CLOCK_POLARITY IdleLow, CLOCK_PHASE SampleOnLeadingSck (mode 0)
+```
+The deployment schedules both drivers through the passive-cycler → `Svc.Sched` adapter (fprime-samd PR), SPI host first so a completion and the phase it triggers land in one cycle, and connects each client pair unindexed — `match` keeps request and completion on one index.
+```fpp
+cycler.cycleOut -> schedAdapter.activeIn            # adapter returns false: one pass per cycle
+schedAdapter.schedOut[0] -> Fram.spiDriver.schedIn  # SpiDriver leaves ISR context here
+schedAdapter.schedOut[1] -> Fram.framDriver.schedIn
+client.framReadOut -> Fram.framDriver.read          Fram.framDriver.readComplete -> client.readCompleteIn
+```
+### 2.5 Behavior
+On its first `schedIn` the driver issues RDID (9Fh), on that reply issues RDSR (05h), and on that reply logs `FramStartupComplete(deviceIdMatch, writeProtected, statusRegister)` once — preceded by `FramDeviceIdMismatch`, `FramDeviceIdReadFailed` or `FramStatusReadFailed` when applicable — and starts accepting requests; until then every request returns `BUSY`. A request is checked in the order null buffer (assert, caller fault), `INVALID_SIZE` (0 or above `MaxTransfer`), `OUT_OF_RANGE` (offset + size above `DEVICE_SIZE`), `BUSY` (transaction in flight); a rejected request gets no completion, an accepted one records index, offset and buffer, issues READ 03h (or WREN 06h for a write) as one chip-select cycle through `spiWriteReadOut`, and returns `OK`. Every `spiReplyIn` — completion or refusal (`SPI_BUSY_ERR`, `SPI_CONFIG_ERR`) — arrives in main context from the SPI host's `schedIn`, never re-entrantly, so the driver acts on it directly: after WREN it issues WRITE 02h, after READ it copies the received bytes into the client buffer, after any failed transfer it logs `FramSpiError` and substitutes `SPI_ERROR`, then returns to `IDLE` and invokes `readComplete[i]` / `writeComplete[i]` with offset, buffer and status on the issuing index. A reply that does not name the in-flight staging buffers, or arrives while idle, is ignored — nothing completes, nothing asserts, the next request is served. Because the state is `IDLE` before the completion call, a client may issue its next request from inside the callback; with no ISR path left in the component, no atomics or critical sections are needed.
+```mermaid
+sequenceDiagram
+    participant S as SpiDriver (Drv.AsyncGuardedSpi; DMAC ISR latches, schedIn replies)
+    participant Y as schedAdapter (main)
+    Client->>FramDriver: write[i](offset, buffer)
+    FramDriver->>S: spiWriteReadOut(WREN)   [WREN_IN_FLIGHT]
+    FramDriver-->>Client: return OK
+    Y->>S: schedIn   (DMA done, latched in the ISR)
+    S->>FramDriver: spiReplyIn(SPI_OK)
+    FramDriver->>S: spiWriteReadOut(WRITE 02h A2 A1 A0 data)   [WRITE_IN_FLIGHT]
+    Y->>S: schedIn
+    S->>FramDriver: spiReplyIn(status)   [→ IDLE]
+    FramDriver->>Client: writeComplete[i](offset, buffer, OK | SPI_ERROR)
+    Client->>FramDriver: read[i](…) from the callback → OK (REQ-019)
 ```
 
-State machine:
+## 3. Tests
 
-```
-IDLE ──read──▶ READ_IN_FLIGHT ──ISR: OK──▶ REPLY_PENDING ──activeIn──▶ IDLE (readComplete)
-IDLE ──write─▶ WREN_IN_FLIGHT ──ISR: OK──▶ WRITE_PENDING ──activeIn──▶ WRITE_IN_FLIGHT ──ISR: OK──▶ REPLY_PENDING ──activeIn──▶ IDLE (writeComplete)
-any *_IN_FLIGHT ──ISR: error──▶ REPLY_PENDING(SPI_ERROR)
-```
+### 3.1 Unit tests
+| Test | Description | Requirements |
+|---|---|---|
+| UT-01 | read at 0x012345 delivers 7 bytes; TX `03 01 23 45`; `readComplete[0]` OK | REQ-FRAM-001 |
+| UT-02 | write at 0x3FF80: WREN then `02 03 FF 80` + 128 bytes; `writeComplete[0]` OK | REQ-FRAM-002 |
+| UT-03 | opcode + 3 MSB-first address bytes; read is one transfer; write is WREN then WRITE | REQ-FRAM-003 |
+| UT-04 | request returns OK with one transfer issued; completion only after the reply | REQ-FRAM-004 |
+| UT-05 | completion index equals request index for read on 1 and write on 0 | REQ-FRAM-005 |
+| UT-07 | size 0 and 129 return INVALID_SIZE, nothing issued; size 128 accepted | REQ-FRAM-007 |
+| UT-08 | offset + size > DEVICE_SIZE returns OUT_OF_RANGE; == DEVICE_SIZE accepted with address `03 FF 80` | REQ-FRAM-008 |
+| UT-09 | second and third requests return BUSY; only the first completes with its own offset/buffer | REQ-FRAM-009 |
+| UT-10 | rejected requests never produce a completion over 5 further `schedIn` calls | REQ-FRAM-010 |
+| UT-11 | reply errors (incl. SPI_BUSY_ERR refusal) on READ/WREN/WRITE → `FramSpiError`, SPI_ERROR; next request OK | REQ-FRAM-011 |
+| UT-12 | null buffer on read and on write fires the assert hook; nothing issued | REQ-FRAM-012 |
+| UT-13 | reply while idle, with foreign buffers, or duplicated: no completion, no assert, next request OK | REQ-FRAM-013 |
+| UT-14 | one RDID (`9F`+9 bytes) per boot; last byte +1 → `FramDeviceIdMismatch(expected, got)` | REQ-FRAM-014 |
+| UT-15 | RDID error → `FramDeviceIdReadFailed`, RDSR still issued; RDSR error → `FramStatusReadFailed` | REQ-FRAM-015 |
+| UT-16 | after mismatch or failed startup reads a client read completes OK | REQ-FRAM-016 |
+| UT-17 | every captured TX opcode ∈ {03, 02, 06, 05, 9F} | REQ-FRAM-017 |
+| UT-18 | request before the first `schedIn` returns BUSY; no transfer until the first `schedIn` | REQ-FRAM-018 |
+| UT-19 | write issued from inside `readComplete` is accepted; original completion arguments intact | REQ-FRAM-019 |
+| UT-21 | `static_assert(sizeof(FramDriver) + file-scope objects <= 640)`; failing `operator new` links | REQ-FRAM-021 |
+| UT-24 | reads before the RDID and RDSR replies return BUSY; accepted after startup | REQ-FRAM-024 |
+| UT-25 | null + size 0 asserts; size 0 out-of-range → INVALID_SIZE; busy + out-of-range → OUT_OF_RANGE | REQ-FRAM-025 |
+| UT-26 | RDSR 0x0C → `FramStartupComplete(true, true, 0x0C)`, write still completes OK; 0x40 → unprotected | REQ-FRAM-026 |
+| UT-27 | configure fails for `MaxTransfer` 0, `MaxTransfer` > DEVICE_SIZE, `ClientPorts` 0 (negative builds) | REQ-FRAM-027 |
+| UT-28 | once per boot; failed RDID → `(false, false, 0x00)`, failed RDSR → `(true, false, 0xFF)` | REQ-FRAM-028 |
+| UT-RB | STest rules Read/Write/RejectSize/RejectRange/Busy/SpiError/SpuriousReply/Callback, 10 000 random steps, invariants hold | REQ-FRAM-001, -002, -004, -005, -007, -008, -009, -010, -011, -013, -019, -025 |
+| INS-23 | source inspection: FramDriver creates no thread, queue or OS object | REQ-FRAM-023 |
 
-The `WRITE` is launched from `activeIn`, not from inside the `WREN` completion
-callback: that callback runs in the DMAC ISR before `Samd21.DmaDriver` has
-finished its own channel bookkeeping, and queuing the next transaction from there
-is a documented-unsafe pattern (it orphaned the descriptor chain on hardware). The
-cost is at most one cycler tick of extra write latency.
-
-Rejections (`BUSY`, `OUT_OF_RANGE`, `TOO_LARGE`) are delivered **synchronously
-from inside the request call**, on the matching reply port, with no SPI traffic.
-Clients must therefore commit their own state before issuing a request (see
-`CuriosityReference/FramTester/docs/sdd.md` §3.5 for the client contract).
-
-### 3.4.1 Startup device identification (REQ-FRAM-013..016)
-
-The first `activeIn` tick that finds the driver `IDLE` (normally the first tick after
-`configure()`, when the SPI host and the event ports are connected) stages one `RDID`
-frame — `9Fh` followed by nine `00h` dummy bytes, 10 bytes under one chip select — in the
-READ/WRITE staging buffers and clocks it through the normal `READ_IN_FLIGHT` state with
-`Operation::IDENTIFY`. Clients see `BUSY` until it completes. The outcome is latched in the
-SPI ISR like any frame and consumed on the next tick in main context: on `OK` bytes
-`rx[1..9]` are compared with `Fram::EXPECTED_DEVICE_ID`; a difference logs
-`FramDeviceIdMismatch` with both IDs rendered as 18 upper-case hex characters. Any other
-outcome (SPI failure) returns the driver to `IDLE` silently: the part is simply not
-identified, and no retry port exists. The read happens exactly once per boot
-(`m_identified`); the event is never raised from `configure()`, the constructor or ISR
-context, so it cannot fire before the port connections are made, and the autocoded
-`log_WARNING_HI_*` call is itself guarded by `isConnected` on the event ports.
-
-Expected ID (`FramDeviceIdConfig.hpp`, part of `FramSubtopologyConfig`), stored in wire
-order: Infineon datasheet 002-26764 Rev. *D (CY15B102QN/CY15V102QN, 2022-09-12), section
-"Read device ID (RDID, 9Fh)" and the "Ordering information" table, give the CY15B102QN ID as
-`7F7F7F7F7F7FC22A00` MSB first — six `7Fh` JEDEC continuation bytes, manufacturer `C2h`,
-product ID `2A00h` — and state that byte 0 (least significant) shifts out first, so the
-driver receives `00 2A C2 7F 7F 7F 7F 7F 7F` (verified on the Curiosity Nano bench: the
-mismatch event reports `got 002AC27F7F7F7F7F7F` when the MSB-first value is configured).
-The CY15V102QN reads `…C22A04`. A different fitted part only needs this constant changed.
-The strings in the event are 18 characters; a deployment whose `FW_LOG_STRING_MAX_SIZE` is
-smaller (the SAMD21 reference uses 2) sees them truncated.
-
-### 3.5 Error handling
-
-- Any `Drv::SpiStatus` other than `SPI_OK` in any phase → `SPI_ERROR`; for a write
-  this includes a failed `WREN`, after which no `WRITE` is issued.
-- Validation failures never reach the SPI bus.
-- Protocol violations by the SPI host (reply while idle, foreign buffers) are
-  `FW_ASSERT`s: they indicate a wiring or driver bug, not a runtime condition.
-- A reply whose completion output port is unconnected is dropped; the subtopology
-  wiring (`match`) and the deployment are responsible for connecting both ports of
-  every used index.
-
-### 3.6 Completion delivery
-
-`spiReplyIn` runs in ISR context and touches only `m_state`/`m_status` (both
-`volatile`) and the staging buffers. `activeIn` runs in main context, copies read
-data into the client buffer, and invokes the client's completion port. The
-`Svc.ActiveSched` return value lets `Svc.PassiveCycler` know whether the tick did work.
-
-## 4. Integration
-
-`Fram.Subtopology` (`Fram/Subtopology/Subtopology.fpp`) instantiates `framDriver`
-and the `Samd21.SpiDriver` instance `spiDriver`, connects them, and configures
-`spiDriver` in its `configComponents` phase from `FramSubtopologyConfig.hpp`. A
-deployment:
-
-1. adds `./lib/fprime-samd` to `library_locations` and `fprime-samd_Devices_Fram_Subtopology` to its topology dependencies;
-2. includes `fprime-samd/Devices/Fram/Subtopology/FramSubtopologyTopologyDefs.hpp` from its `TopologyDefs.hpp`;
-3. imports `Fram.Subtopology` into its topology and connects:
-   - `cycler.cycleOut -> Fram.framDriver.activeIn`
-   - `Fram.spiDriver.dmaTransactionOut[MOSI|MISO] <-> dmaDriver` (two DMA channels)
-   - `Fram.spiDriver.chipSelectGpioOut[Fram.SubtopologyConfig.SPI_SLOT] -> <cs gpio>.gpioWrite`
-   - its client(s) to `Fram.framDriver.read/write` and the matching completion ports;
-4. configures the chip-select GPIO as an output **before** `configComponents()` — `SpiDriver::configure()` deasserts the chip select through the GPIO port, and an unconfigured `Samd21.GpioDriver` drops the write.
-
-Default SPI host settings (`FramSubtopologyConfig.hpp`): SERCOM1, MOSI PA16 (PAD0), SCK PA17 (PAD1), MISO PA19 (PAD3), software chip select, SPI mode 0, 4 MHz. A deployment that wires the part differently overrides that configuration module.
-
-The driver binds to `Samd21.SpiWriteRead`/`Samd21.SpiReply`, the asynchronous SPI interface of this library, which is why it lives under `fprime-samd/Devices` rather than in a platform-neutral package.
-
-## 5. Unit tests
-
-`test/ut/` (`fprime-util check` natively) covers every interface: read/write framing and
-buffer identity, same-index completion on all client ports, every rejection
-(zero size, oversize, end-of-device, overflow, busy), SPI failure in each phase
-including the WREN abort, synchronous rejection by the SPI host, replies only on
-`activeIn`, client re-entrancy from the completion callback, 1000 randomized
-transactions, the assertion on a stray SPI reply, and the startup identification
-(matching ID with no event, mismatching ID with the event strings, SPI failure on the
-`RDID` frame returning to `IDLE`, clients rejected `BUSY` while it is in flight).
-
-## 6. Tested configurations
-
-| Target | SPI host | Result |
-| ------ | -------- | ------ |
-| SAMD21 Curiosity Nano + CY15B102QN, SERCOM1 @ 4 MHz mode 0, software CS PA18 | `Samd21.SpiDriver` + `Samd21.DmaDriver` | Hardware tested via `CuriosityReference.FramTester` |
+### 3.2 Integration tests (any deployment with the component)
+| Test | Description | Requirements |
+|---|---|---|
+| INT-1 | after SWD reset: `FramStartupComplete(true, false, …)`, no warnings, two boot segments | REQ-FRAM-014, -017, -018, -026, -028 |
+| INT-2 | 128-byte write and read-back at offset 0 and the last page, index 0 | REQ-FRAM-001, -002, -003, -004, -005, -008 |
+| INT-3 | single bytes at 0x000001, 0x000100, 0x010000 read back without aliasing | REQ-FRAM-003 |
+| INT-4 | all 2048 pages written then verified with chained completions, all in thread mode | REQ-FRAM-001, -002, -004, -005, -019 |
+| INT-5 | write/verify on index 1 and verify on index 0 complete on their own indices | REQ-FRAM-005 |
+| INT-6 | full-device image survives an MCU reset (startup event, RCAUSE) and verifies | REQ-FRAM-022, -014, -017, -028 |
+| INT-7 | the same image survives a hub-port power cycle and verifies | REQ-FRAM-022 |
+| INT-8 | 300 s verify-then-write soak: ≥ 280 pairs, zero stalls, mismatches, SPI errors | REQ-FRAM-019, -011 |
+| INT-9 | SWD reset during a continuous sweep: clean startup, every page reads back | REQ-FRAM-014, -018, -022, -028 |
+| INT-10 | second request during a transaction returns BUSY, writes nothing, first completes | REQ-FRAM-009, -010, -004 |
+| INT-11 | requests past the device end return OUT_OF_RANGE; last page unchanged | REQ-FRAM-008, -010 |
+| INT-12 | sizes 0 and 129 → INVALID_SIZE despite out-of-range or busy; busy + out-of-range → OUT_OF_RANGE | REQ-FRAM-007, -010, -025 |
+| INT-13 | device left as the handed-over pseudo-random image; independent dump equals it byte-for-byte | REQ-FRAM-002, -003, -022 |

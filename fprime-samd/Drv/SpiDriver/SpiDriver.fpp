@@ -1,16 +1,25 @@
 module Samd21 {
-    @ Driver for the SAMD21 SPI Peripheral
+    @ Driver for the SAMD21 SPI Peripheral (host mode, DMA in both directions)
     passive component SpiDriver {
 
-        @ An enum for selecting the two DMA channels on the USART
+        @ An enum for selecting the two DMA channels on the SERCOM
         enum DmaChannel {
             MOSI,     @< DMA channel for transmission
             MISO,     @< DMA channel for receive
             N
         }
 
-        @ Note! The SpiReply signal is sent on an ISR
-        import Samd21.AsyncSpi
+        @ Asynchronous SPI contract: SpiWriteRead[slot] starts one full-duplex transfer; every
+        @ request is answered with exactly one SpiWriteReadComplete[slot] (SPI_OK, SPI_OTHER_ERR
+        @ on a receive overrun, SPI_BUSY_ERR while another transfer is in flight, SPI_CONFIG_ERR
+        @ before configure()). Completions are delivered from schedIn, never from an ISR and
+        @ never from inside the request call.
+        import Drv.AsyncGuardedSpi
+
+        @ REQUIRED CONNECTION. Main-context delivery of the completions latched by the DMAC
+        @ and SERCOM interrupts (and of refused requests). Connect to the deployment's
+        @ scheduler (Svc.PassiveCycler through Svc.PassiveSchedAdapter, or a rate group).
+        sync input port schedIn: Svc.Sched
 
         @ Port to send a DMA transaction to the DMA driver
         output port dmaTransactionOut: [DmaChannel.N] Dma.Transaction
@@ -20,13 +29,13 @@ module Samd21 {
         output port dmaTransactionAbortOut: [DmaChannel.N] Fw.Signal
 
         @ A signal from the DMAC that a request has finished.
-        @ This signal comes inside an ISR!
+        @ This signal comes inside an ISR! Only the outcome is latched here.
         sync input port dmaReplyIn: [DmaChannel.N] Dma.TransactionReply
 
         @ When the hardware chip select is disabled on this driver, this port controls
-        @ the chip select pin through software. The port number corresponds to the port
-        @ from the AsyncSpi interface.
-        output port chipSelectGpioOut: [Samd21.SpiPorts] Drv.GpioWrite
+        @ the chip select pin through software. The port number is the device slot, i.e.
+        @ the index of the SpiWriteRead / SpiWriteReadComplete ports.
+        output port chipSelectGpioOut: [Drv.AsyncSpiCfg.SpiDriverPorts] Drv.GpioWrite
 
     }
 }

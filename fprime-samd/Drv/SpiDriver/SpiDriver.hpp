@@ -99,6 +99,10 @@ class SpiDriver final : public SpiDriverComponentBase {
     //! rate is zero, above fref/2, or too slow for the 8-bit BAUD register.
     static U8 calculateBaud(U32 f_ref_hz, U32 baud_rate_khz);
 
+    //! Change the SCK rate of a configured driver (e.g. SD card: slow for identification,
+    //! fast afterwards). Asserts when not configured or while a transfer is in flight.
+    void setBaudRate(U32 baud_rate_khz);
+
     void configure(SercomKind sercom,
                    U32 baud_rate_khz,
                    DataOrder data_order,
@@ -114,15 +118,23 @@ class SpiDriver final : public SpiDriverComponentBase {
     // Handler implementations for typed input ports
     // ----------------------------------------------------------------------
 
-    //! Handler implementation for SpiWriteRead
+    //! Handler implementation for SpiWriteRead (Drv.AsyncGuardedSpi). Starts the transfer
+    //! or latches a refusal (SPI_BUSY_ERR, SPI_CONFIG_ERR); the outcome always arrives on
+    //! SpiWriteReadComplete from schedIn.
     void SpiWriteRead_handler(FwIndexType portNum,  //!< The port number
                               Fw::Buffer& writeBuffer,
                               Fw::Buffer& readBuffer) override;
 
+    //! Handler implementation for schedIn: delivers every latched reply (main context)
+    void schedIn_handler(FwIndexType portNum,  //!< The port number
+                         U32 context           //!< The call order
+                         ) override;
+
     //! Handler implementation for dmaReplyIn
     //!
-    //! A signal from the DMAC that a request has finished.
-    //! This signal comes inside an ISR!
+    //! A signal from the DMAC that a request has finished. This signal comes inside an
+    //! ISR: it only releases the chip select and latches the reply. A reply that matches
+    //! no transfer in flight is ignored.
     void dmaReplyIn_handler(FwIndexType portNum,  //!< The port number
                             const Samd21::Dma::Reply& reply) override;
 
@@ -137,6 +149,17 @@ class SpiDriver final : public SpiDriverComponentBase {
     //! block can never complete. Abort the outstanding DMA streams, release the
     //! chip select and fail the transaction back to the caller. ISR context.
     void isrHandler();
+
+    //! Release the chip select of the transfer in flight (software chip select only)
+    void deassertChipSelect();
+
+    //! Latch a reply for `portNum` to be delivered by the next schedIn. Asserts when that
+    //! slot already holds an undelivered reply (a client must wait for its completion
+    //! before issuing the next request on the same slot).
+    void latchReply(FwIndexType portNum,
+                    const Fw::Buffer& writeBuffer,
+                    const Fw::Buffer& readBuffer,
+                    Drv::SpiStatus::T status);
 
     SercomKind m_sercom;
 
@@ -159,6 +182,17 @@ class SpiDriver final : public SpiDriverComponentBase {
     U8 m_busy;
 
     bool m_hardware_chip_select;
+
+    //! One completion waiting for schedIn, per slot. Written by the ISR paths (transfer
+    //! done, receive overrun) and by refused requests; read and cleared by schedIn under a
+    //! critical section.
+    struct PendingReply {
+        Samd21::ThinBuffer write;
+        Samd21::ThinBuffer read;
+        Drv::SpiStatus::T status;
+        bool pending;
+    };
+    PendingReply m_pending[NUM_SPIWRITEREAD_INPUT_PORTS];
 };
 
 }  // namespace Samd21

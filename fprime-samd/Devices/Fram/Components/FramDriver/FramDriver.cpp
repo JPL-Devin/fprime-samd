@@ -1,27 +1,28 @@
 // ======================================================================
 // \title  FramDriver.cpp
-// \brief  cpp file for FramDriver component implementation class
+// \brief  Protocol driver for the Infineon CY15B102QN SPI F-RAM (see docs/sdd.md)
 // ======================================================================
 
 #include "fprime-samd/Devices/Fram/Components/FramDriver/FramDriver.hpp"
-#include "fprime-samd/Devices/Fram/Subtopology/FramSubtopologyConfig/FramDeviceIdConfig.hpp"
 
 #include <cstdio>
 #include <cstring>
 
 #include "Fw/Types/Assert.hpp"
+#include "Fw/Types/StringTemplate.hpp"
 #include "config/FwAssertArgTypeAliasAc.h"
+#include "fprime-samd/Devices/Fram/FramConfig/FramDeviceIdConfig.hpp"
 
 namespace Fram {
 
-// C++14: static constexpr members that are odr-used (the unit test binds them by reference)
-// need an out-of-class definition.
-constexpr U8 FramDriver::OPCODE_WREN;
-constexpr U8 FramDriver::OPCODE_WRITE;
-constexpr U8 FramDriver::OPCODE_READ;
-constexpr U8 FramDriver::OPCODE_RDID;
-constexpr FwSizeType FramDriver::DEVICE_ID_SIZE;
-constexpr FwSizeType FramDriver::FRAME_SIZE;
+// REQ-FRAM-027: a configuration the driver cannot serve does not build
+static_assert(Fram::Config::MaxTransfer >= 1, "Fram.Config.MaxTransfer must be at least 1");
+static_assert(Fram::Config::MaxTransfer <= Fram::DEVICE_SIZE, "Fram.Config.MaxTransfer exceeds the device");
+static_assert(FramDriver::FRAME_SIZE >= 1 + Fram::DEVICE_ID_SIZE, "staging must hold the RDID frame");
+static_assert(Fram::Config::ClientPorts > 0, "Fram.Config.ClientPorts must be at least 1");
+static_assert(sizeof(Fram::EXPECTED_DEVICE_ID) == Fram::DEVICE_ID_SIZE, "EXPECTED_DEVICE_ID size");
+
+static_assert(Fram::HEADER_SIZE == 1 + Fram::ADDRESS_BYTES, "frame header is opcode + address");
 
 // ----------------------------------------------------------------------
 // Component construction and destruction
@@ -29,17 +30,13 @@ constexpr FwSizeType FramDriver::FRAME_SIZE;
 
 FramDriver ::FramDriver(const char* const compName)
     : FramDriverComponentBase(compName),
-      m_state(State::IDLE),
-      m_identified(false),
-      m_operation(Operation::READ),
+      m_state(State::STARTUP),
+      m_deviceIdMatch(false),
       m_portNum(0),
       m_offset(0),
       m_clientBuffer(),
-      m_status(Fram::Status::OK),
-      m_tx{},
-      m_rx{},
-      m_wrenTx{OPCODE_WREN},
-      m_wrenRx{},
+      m_tx(),
+      m_rx(),
       m_spiWrite(),
       m_spiRead() {}
 
@@ -49,140 +46,88 @@ FramDriver ::~FramDriver() {}
 // Handler implementations for typed input ports
 // ----------------------------------------------------------------------
 
-bool FramDriver ::activeIn_handler(FwIndexType portNum, U32 context) {
-    (void)portNum;  // One cycler drives this component
-    (void)context;  // The cycler's call-order token is unused here
-
-    if (this->m_state == State::IDLE && !this->m_identified) {
-        // First tick with the bus idle: events and SPI are connected by now (REQ-FRAM-013)
-        this->m_identified = true;
-        this->identify();
-        return true;
+Fram::Status FramDriver ::read_handler(FwIndexType portNum, U32 offset, Fw::Buffer& buffer) {
+    const Fram::Status verdict = this->admit(buffer, offset);
+    if (verdict != Fram::Status::OK) {
+        return verdict;
     }
-    if (this->m_state == State::WRITE_PENDING) {
-        // WREN completed in the ISR; the latch is set, clock the WRITE frame staged by
-        // write_handler. Done here rather than from the SPI completion because the DMAC
-        // driver delivers that completion before it has finished its channel bookkeeping,
-        // so a transaction queued from inside it corrupts the channel's descriptor chain.
-        this->m_state = State::WRITE_IN_FLIGHT;
-        this->startTransfer(this->m_tx, this->m_rx, Fram::HEADER_SIZE + this->m_clientBuffer.getSize());
-        return true;
-    }
-
-    if (this->m_state != State::REPLY_PENDING) {
-        return false;
-    }
-
-    if (this->m_operation == Operation::IDENTIFY) {
-        // No client behind the RDID frame; a SPI failure leaves the part unidentified
-        const Fram::Status status = this->m_status;
-        this->m_state = State::IDLE;
-        if (status == Fram::Status::OK) {
-            this->checkDeviceId();
-        }
-        return true;
-    }
-    const FwSizeType size = this->m_clientBuffer.getSize();
-    if (this->m_operation == Operation::READ && this->m_status == Fram::Status::OK) {
-        // The first HEADER_SIZE bytes clocked in are what the device shifted out while it was
-        // receiving the opcode and address; the data starts after them.
-        (void)std::memcpy(this->m_clientBuffer.getData(), &this->m_rx[Fram::HEADER_SIZE], size);
-    }
-
-    // Snapshot and go idle BEFORE replying: the client may issue its next request from
-    // inside the reply, and that request must see an idle driver.
-    const Operation operation = this->m_operation;
-    const FwIndexType clientPort = this->m_portNum;
-    const U32 offset = this->m_offset;
-    Fw::Buffer buffer = this->m_clientBuffer;
-    const Fram::Status status = this->m_status;
-    this->m_state = State::IDLE;
-
-    if (operation == Operation::READ) {
-        if (this->isConnected_readComplete_OutputPort(clientPort)) {
-            this->readComplete_out(clientPort, offset, buffer, status);
-        }
-    } else {
-        if (this->isConnected_writeComplete_OutputPort(clientPort)) {
-            this->writeComplete_out(clientPort, offset, buffer, status);
-        }
-    }
-    return true;
+    this->record(portNum, offset, buffer, OPCODE_READ);
+    // The data phase clocks zeros out while the device shifts the memory contents in
+    std::memset(&this->m_tx[Fram::HEADER_SIZE], 0, buffer.getSize());
+    this->issue(State::READ_IN_FLIGHT, static_cast<U32>(Fram::HEADER_SIZE) + buffer.getSize());
+    return Fram::Status::OK;
 }
 
-void FramDriver ::read_handler(FwIndexType portNum, U32 offset, Fw::Buffer& buffer) {
-    const Fram::Status status = this->admit(offset, buffer);
-    if (status != Fram::Status::OK) {
-        this->reject(Operation::READ, portNum, offset, buffer, status);
-        return;
+Fram::Status FramDriver ::write_handler(FwIndexType portNum, U32 offset, Fw::Buffer& buffer) {
+    const Fram::Status verdict = this->admit(buffer, offset);
+    if (verdict != Fram::Status::OK) {
+        return verdict;
     }
-
-    this->begin(Operation::READ, portNum, offset, buffer, OPCODE_READ);
-
-    // The bytes clocked out while the data comes back are don't-care; zero them so the frame
-    // is deterministic on the wire.
-    const FwSizeType size = buffer.getSize();
-    (void)std::memset(&this->m_tx[Fram::HEADER_SIZE], 0, size);
-
-    this->m_state = State::READ_IN_FLIGHT;
-    this->startTransfer(this->m_tx, this->m_rx, Fram::HEADER_SIZE + size);
-}
-
-void FramDriver ::write_handler(FwIndexType portNum, U32 offset, Fw::Buffer& buffer) {
-    const Fram::Status status = this->admit(offset, buffer);
-    if (status != Fram::Status::OK) {
-        this->reject(Operation::WRITE, portNum, offset, buffer, status);
-        return;
-    }
-
-    this->begin(Operation::WRITE, portNum, offset, buffer, OPCODE_WRITE);
-
-    // Stage the data now, in main context, so the ISR only has to launch the frame.
-    const FwSizeType size = buffer.getSize();
-    (void)std::memcpy(&this->m_tx[Fram::HEADER_SIZE], buffer.getData(), size);
-
-    // Every WRITE must be preceded by WREN in its own chip-select cycle; the device clears
-    // the write-enable latch again when the WRITE completes.
-    this->m_state = State::WREN_IN_FLIGHT;
-    this->startTransfer(this->m_wrenTx, this->m_wrenRx, sizeof this->m_wrenTx);
+    // WREN first, as its own chip-select cycle (datasheet: the write-enable latch is set by
+    // the WREN opcode alone); the WRITE frame is laid out when the WREN reply arrives.
+    this->record(portNum, offset, buffer, OPCODE_WREN);
+    this->issue(State::WREN_IN_FLIGHT, 1);
+    return Fram::Status::OK;
 }
 
 void FramDriver ::spiReplyIn_handler(FwIndexType portNum,
                                      Fw::Buffer& writeBuffer,
                                      Fw::Buffer& readBuffer,
                                      const Drv::SpiStatus& status) {
-    (void)portNum;  // One SPI driver slot drives this component
-
-    // ISR context. A reply with nothing in flight is a driver or wiring defect, not an input.
-    const State state = this->m_state;
-    FW_ASSERT(state == State::READ_IN_FLIGHT || state == State::WREN_IN_FLIGHT || state == State::WRITE_IN_FLIGHT,
-              static_cast<FwAssertArgType>(state));
-
-    // The SPI driver hands back the descriptors it was given, so they must be our staging.
-    const U8* const expectedTx = (state == State::WREN_IN_FLIGHT) ? this->m_wrenTx : this->m_tx;
-    const U8* const expectedRx = (state == State::WREN_IN_FLIGHT) ? this->m_wrenRx : this->m_rx;
-    FW_ASSERT(writeBuffer.getData() == expectedTx, static_cast<FwAssertArgType>(state));
-    FW_ASSERT(readBuffer.getData() == expectedRx, static_cast<FwAssertArgType>(state));
-
-    if (status.e != Drv::SpiStatus::SPI_OK) {
-        // Includes the SPI driver's busy rejection. After a failed WREN the WRITE is not
-        // attempted: without the latch set it would be silently ignored by the device.
-        this->finish(Fram::Status::SPI_ERROR);
+    // REQ-FRAM-013: a reply that does not belong to the frame in flight is ignored, never
+    // asserted on: no completion, no event, state unchanged.
+    const bool inFlight = (this->m_state != State::STARTUP) && (this->m_state != State::IDLE);
+    if (!inFlight || writeBuffer.getData() != this->m_tx || readBuffer.getData() != this->m_rx) {
         return;
     }
-
-    switch (state) {
-        case State::WREN_IN_FLIGHT:
-            // Latch is set; the WRITE frame goes out from activeIn, in main context.
-            this->m_state = State::WRITE_PENDING;
+    switch (this->m_state) {
+        case State::ID_IN_FLIGHT:
+            this->onDeviceIdReply(status);
+            break;
+        case State::SR_IN_FLIGHT:
+            this->onStatusRegisterReply(status);
             break;
         case State::READ_IN_FLIGHT:
+            if (status != Drv::SpiStatus::SPI_OK) {
+                this->fail(Fram::Operation::READ, status);
+            } else {
+                std::memcpy(this->m_clientBuffer.getData(), &this->m_rx[Fram::HEADER_SIZE],
+                            this->m_clientBuffer.getSize());
+                this->complete(Fram::Status::OK);
+            }
+            break;
+        case State::WREN_IN_FLIGHT:
+            if (status != Drv::SpiStatus::SPI_OK) {
+                this->fail(Fram::Operation::WRITE_ENABLE, status);
+            } else {
+                // Same record, now the WRITE frame: opcode, address, then the client's data
+                this->record(this->m_portNum, this->m_offset, this->m_clientBuffer, OPCODE_WRITE);
+                std::memcpy(&this->m_tx[Fram::HEADER_SIZE], this->m_clientBuffer.getData(),
+                            this->m_clientBuffer.getSize());
+                this->issue(State::WRITE_IN_FLIGHT,
+                            static_cast<U32>(Fram::HEADER_SIZE) + this->m_clientBuffer.getSize());
+            }
+            break;
         case State::WRITE_IN_FLIGHT:
-            this->finish(Fram::Status::OK);
+            if (status != Drv::SpiStatus::SPI_OK) {
+                this->fail(Fram::Operation::WRITE, status);
+            } else {
+                this->complete(Fram::Status::OK);
+            }
             break;
         default:
-            // Excluded by the assert above
-            break;
+            // Unreachable: inFlight excludes STARTUP and IDLE
+            FW_ASSERT(false, static_cast<FwAssertArgType>(this->m_state));
+    }
+}
+
+void FramDriver ::schedIn_handler(FwIndexType portNum, U32 context) {
+    // REQ-FRAM-018: the first scheduled call starts the startup transactions; later calls
+    // have nothing to do (replies arrive on spiReplyIn in main context).
+    if (this->m_state == State::STARTUP) {
+        std::memset(this->m_tx, 0, 1 + Fram::DEVICE_ID_SIZE);
+        this->m_tx[0] = OPCODE_RDID;
+        this->issue(State::ID_IN_FLIGHT, 1 + Fram::DEVICE_ID_SIZE);
     }
 }
 
@@ -190,13 +135,15 @@ void FramDriver ::spiReplyIn_handler(FwIndexType portNum,
 // Helpers
 // ----------------------------------------------------------------------
 
-Fram::Status FramDriver ::admit(U32 offset, const Fw::Buffer& buffer) const {
-    const FwSizeType size = buffer.getSize();
+Fram::Status FramDriver ::admit(const Fw::Buffer& buffer, U32 offset) const {
+    // A null data pointer is a programming error of the caller, not a request to reject
+    FW_ASSERT(buffer.getData() != nullptr);
+    const U32 size = static_cast<U32>(buffer.getSize());
     if (size == 0 || size > Fram::Config::MaxTransfer) {
-        return Fram::Status::TOO_LARGE;
+        return Fram::Status::INVALID_SIZE;
     }
-    // Written so that offset + size cannot wrap
-    if (offset >= Fram::DEVICE_SIZE || size > static_cast<FwSizeType>(Fram::DEVICE_SIZE - offset)) {
+    // offset + size > DEVICE_SIZE without the addition overflowing
+    if (offset > static_cast<U32>(Fram::DEVICE_SIZE) - size) {
         return Fram::Status::OUT_OF_RANGE;
     }
     if (this->m_state != State::IDLE) {
@@ -205,92 +152,88 @@ Fram::Status FramDriver ::admit(U32 offset, const Fw::Buffer& buffer) const {
     return Fram::Status::OK;
 }
 
-void FramDriver ::reject(Operation operation,
-                         FwIndexType portNum,
-                         U32 offset,
-                         Fw::Buffer& buffer,
-                         Fram::Status status) {
-    if (operation == Operation::READ) {
-        if (this->isConnected_readComplete_OutputPort(portNum)) {
-            this->readComplete_out(portNum, offset, buffer, status);
-        }
-    } else {
-        if (this->isConnected_writeComplete_OutputPort(portNum)) {
-            this->writeComplete_out(portNum, offset, buffer, status);
-        }
-    }
-}
-
-void FramDriver ::begin(Operation operation, FwIndexType portNum, U32 offset, Fw::Buffer& buffer, U8 opcode) {
-    // A non-empty buffer without storage is a defect in the client, not an input to validate.
-    FW_ASSERT(buffer.getData() != nullptr, static_cast<FwAssertArgType>(portNum));
-
-    this->m_operation = operation;
+void FramDriver ::record(FwIndexType portNum, U32 offset, const Fw::Buffer& buffer, U8 opcode) {
     this->m_portNum = portNum;
     this->m_offset = offset;
     this->m_clientBuffer = buffer;
-    this->m_status = Fram::Status::OK;
-
-    // Opcode, then the 18-bit address in three bytes, most significant first. The upper six
-    // bits are zero because admit() bounded the offset to DEVICE_SIZE.
+    // Opcode, then the 3-byte address most significant byte first (datasheet "READ"/"WRITE")
     this->m_tx[0] = opcode;
     this->m_tx[1] = static_cast<U8>((offset >> 16) & 0xFF);
     this->m_tx[2] = static_cast<U8>((offset >> 8) & 0xFF);
     this->m_tx[3] = static_cast<U8>(offset & 0xFF);
 }
 
-void FramDriver ::startTransfer(U8* tx, U8* rx, FwSizeType frameSize) {
-    FW_ASSERT(frameSize >= 1 && frameSize <= FRAME_SIZE, static_cast<FwAssertArgType>(frameSize));
-    this->m_spiWrite.set(tx, frameSize);
-    this->m_spiRead.set(rx, frameSize);
-
-    // The SPI driver replies through spiReplyIn: from the DMAC ISR when the frame completes,
-    // or SYNCHRONOUSLY from inside this call if it is busy with another slot's transaction.
+void FramDriver ::issue(State next, U32 length) {
+    FW_ASSERT(length >= 1 && length <= FRAME_SIZE, length);
+    // State first: the host may answer (refuse) before this call returns, in main context
+    this->m_state = next;
+    this->m_spiWrite.set(this->m_tx, length);
+    this->m_spiRead.set(this->m_rx, length);
     this->spiWriteReadOut_out(0, this->m_spiWrite, this->m_spiRead);
 }
 
-void FramDriver ::identify() {
-    static_assert(1 + DEVICE_ID_SIZE <= FRAME_SIZE, "RDID frame must fit the staging buffers");
-    static_assert(sizeof(Fram::EXPECTED_DEVICE_ID) == DEVICE_ID_SIZE, "EXPECTED_DEVICE_ID is 9 bytes");
-    this->m_operation = Operation::IDENTIFY;
-    this->m_portNum = 0;
-    this->m_offset = 0;
-    this->m_clientBuffer = Fw::Buffer();
-    this->m_status = Fram::Status::OK;
-    // RDID: opcode, then DEVICE_ID_SIZE dummy bytes while the ID is clocked in
-    this->m_tx[0] = OPCODE_RDID;
-    (void)std::memset(&this->m_tx[1], 0, DEVICE_ID_SIZE);
-    this->m_state = State::READ_IN_FLIGHT;
-    this->startTransfer(this->m_tx, this->m_rx, 1 + DEVICE_ID_SIZE);
-}
-
-void FramDriver ::checkDeviceId() {
-    // Byte 0 is what the device shifted out while receiving the opcode; the ID follows
-    const U8* const got = &this->m_rx[1];
-    if (std::memcmp(got, Fram::EXPECTED_DEVICE_ID, DEVICE_ID_SIZE) == 0) {
-        return;
-    }
-    HexString expectedHex;
-    HexString gotHex;
-    toHex(Fram::EXPECTED_DEVICE_ID, DEVICE_ID_SIZE, expectedHex);
-    toHex(got, DEVICE_ID_SIZE, gotHex);
-    this->log_WARNING_HI_FramDeviceIdMismatch(expectedHex, gotHex);
-}
-
-void FramDriver ::toHex(const U8* bytes, FwSizeType size, HexString& out) {
-    char text[2 * DEVICE_ID_SIZE + 1] = {};
-    FW_ASSERT(size <= DEVICE_ID_SIZE, static_cast<FwAssertArgType>(size));
-    for (FwSizeType i = 0; i < size; i++) {
-        (void)snprintf(&text[2 * i], sizeof text - 2 * i, "%02X", bytes[i]);
+static void toHex(const U8* bytes, U32 count, Fw::StringTemplate<24>& out) {
+    char text[2 * Fram::DEVICE_ID_SIZE + 1] = {};
+    for (U32 i = 0; i < count && i < Fram::DEVICE_ID_SIZE; i++) {
+        (void)std::snprintf(&text[2 * i], 3, "%02X", bytes[i]);
     }
     out = text;
 }
 
-void FramDriver ::finish(Fram::Status status) {
-    // Outcome first, state second: activeIn only looks at the outcome once it sees
-    // REPLY_PENDING.
-    this->m_status = status.e;
-    this->m_state = State::REPLY_PENDING;
+void FramDriver ::onDeviceIdReply(const Drv::SpiStatus& status) {
+    if (status != Drv::SpiStatus::SPI_OK) {
+        this->m_deviceIdMatch = false;
+        this->log_WARNING_LO_FramDeviceIdReadFailed(status);
+    } else {
+        // The ID follows the opcode echo: bytes 1 .. DEVICE_ID_SIZE of the receive frame
+        const U8* got = &this->m_rx[1];
+        this->m_deviceIdMatch = (std::memcmp(got, Fram::EXPECTED_DEVICE_ID, Fram::DEVICE_ID_SIZE) == 0);
+        if (!this->m_deviceIdMatch) {
+            Fw::StringTemplate<24> expected;
+            Fw::StringTemplate<24> actual;
+            toHex(Fram::EXPECTED_DEVICE_ID, Fram::DEVICE_ID_SIZE, expected);
+            toHex(got, Fram::DEVICE_ID_SIZE, actual);
+            this->log_WARNING_HI_FramDeviceIdMismatch(expected, actual);
+        }
+    }
+    // Startup continues regardless (REQ-FRAM-015, -016): read the status register
+    this->m_tx[0] = OPCODE_RDSR;
+    this->m_tx[1] = 0;
+    this->issue(State::SR_IN_FLIGHT, 2);
+}
+
+void FramDriver ::onStatusRegisterReply(const Drv::SpiStatus& status) {
+    U8 statusRegister = 0xFF;
+    bool writeProtected = false;
+    if (status != Drv::SpiStatus::SPI_OK) {
+        this->log_WARNING_LO_FramStatusReadFailed(status);
+    } else {
+        statusRegister = this->m_rx[1];
+        writeProtected = (statusRegister & static_cast<U8>(Fram::STATUS_BLOCK_PROTECT_MASK)) != 0;
+    }
+    this->m_state = State::IDLE;
+    this->log_ACTIVITY_LO_FramStartupComplete(this->m_deviceIdMatch, writeProtected, statusRegister);
+}
+
+void FramDriver ::complete(Fram::Status status) {
+    // Copy the record out and free the driver before the client runs: the callback may issue
+    // the next request from inside (REQ-FRAM-019)
+    const FwIndexType portNum = this->m_portNum;
+    const U32 offset = this->m_offset;
+    Fw::Buffer buffer = this->m_clientBuffer;
+    const bool isRead = (this->m_state == State::READ_IN_FLIGHT);
+    this->m_state = State::IDLE;
+    if (isRead) {
+        this->readComplete_out(portNum, offset, buffer, status);
+    } else {
+        this->writeComplete_out(portNum, offset, buffer, status);
+    }
+}
+
+void FramDriver ::fail(Fram::Operation::T operation, const Drv::SpiStatus& status) {
+    this->log_WARNING_HI_FramSpiError(Fram::Operation(operation), status, this->m_offset,
+                                      static_cast<U32>(this->m_clientBuffer.getSize()));
+    this->complete(Fram::Status::SPI_ERROR);
 }
 
 }  // namespace Fram

@@ -376,12 +376,13 @@ void DmaDriver::handleInterrupt() {
         reply.set_status(Samd21::Dma::Status::BUS_ERROR);
         reply.set_remainingBytes(busErrorRemaining);
         this->transactionIsrOut_out(id, reply);
-    }
-    for (U32 i = 0; i < okReplies; i++) {
-        Samd21::Dma::Reply reply;
-        reply.set_status(Samd21::Dma::Status::OK);
-        reply.set_remainingBytes(0);
-        this->transactionIsrOut_out(id, reply);
+    } else {
+        for (U32 i = 0; i < okReplies; i++) {
+            Samd21::Dma::Reply reply;
+            reply.set_status(Samd21::Dma::Status::OK);
+            reply.set_remainingBytes(0);
+            this->transactionIsrOut_out(id, reply);
+        }
     }
 
     Samd21::CriticalSection::leave();

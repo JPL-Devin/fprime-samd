@@ -11,7 +11,7 @@
 #define Fram_FramSubtopologyConfig_hpp
 
 #include <Fw/FPrimeBasicTypes.hpp>
-#include "fprime-samd/Devices/Fram/Subtopology/FramSubtopologyConfig/FramDeviceIdConfig.hpp"
+#include "fprime-samd/Devices/Fram/FramConfig/FramDeviceIdConfig.hpp"
 #include "fprime-samd/Drv/SpiDriver/SpiDriver.hpp"
 #include "fprime-samd/Drv/Types/PinMux.hpp"
 #include "fprime-samd/Drv/Types/SercomKindEnumAc.hpp"

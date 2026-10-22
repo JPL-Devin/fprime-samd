@@ -36,6 +36,16 @@ TEST(Nominal, RandomTransactions) {
     tester.testRandomTransactions();
 }
 
+TEST(Nominal, SetBaudRate) {
+    Samd21::SpiDriverTester tester;
+    tester.testSetBaudRate();
+}
+
+TEST(Nominal, SchedIdle) {
+    Samd21::SpiDriverTester tester;
+    tester.testSchedIdle();
+}
+
 TEST(OffNominal, Busy) {
     Samd21::SpiDriverTester tester;
     tester.testBusy();

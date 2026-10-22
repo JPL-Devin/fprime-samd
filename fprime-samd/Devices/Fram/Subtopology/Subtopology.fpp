@@ -4,7 +4,7 @@ module Fram {
 
     @ The SAMD21 SPI host the F-RAM hangs off. Configured from FramSubtopologyConfig.hpp;
     @ the deployment connects its DMA channels, chip-select GPIO and the main cycler.
-    instance spiDriver: Samd21.SpiDriver base id Fram.SubtopologyConfig.BASE_ID + 0x10 {
+    instance spiDriver: Samd21.SpiDriver base id Fram.SubtopologyConfig.BASE_ID + 0x100 {
         phase Fpp.ToCpp.Phases.configComponents """
         Fram::SubtopologyConfig::Spi::configurePins();
         Fram::spiDriver.configure(
@@ -25,9 +25,12 @@ module Fram {
         instance framDriver
         instance spiDriver
 
+        @ The deployment must also schedule both drivers in main context, SPI host first:
+        @   schedAdapter.schedOut[a] -> Fram.spiDriver.schedIn
+        @   schedAdapter.schedOut[b] -> Fram.framDriver.schedIn   (a < b)
         connections Fram {
             framDriver.spiWriteReadOut -> spiDriver.SpiWriteRead[Fram.SubtopologyConfig.SPI_SLOT]
-            spiDriver.SpiReply[Fram.SubtopologyConfig.SPI_SLOT] -> framDriver.spiReplyIn
+            spiDriver.SpiWriteReadComplete[Fram.SubtopologyConfig.SPI_SLOT] -> framDriver.spiReplyIn
         }
     }
 }

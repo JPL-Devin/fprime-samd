@@ -59,6 +59,11 @@ void SpiHal::configure(SercomKind sercom,
     s_state.hardware_chipselect = hardware_chipselect;
 }
 
+void SpiHal::setBaudRate(SercomKind sercom, U32 baud_rate_khz) {
+    s_state.baud_rate_khz = baud_rate_khz;
+    s_state.set_baud_count++;
+}
+
 U32 SpiHal::getDataRegisterAddress(SercomKind sercom) {
     (void)sercom;
     return s_state.data_register_address;

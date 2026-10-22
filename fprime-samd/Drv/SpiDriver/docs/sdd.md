@@ -5,9 +5,10 @@ asynchronous completion.
 
 ## 1. Introduction
 
-`Samd21::SpiDriver` presents the `Samd21.AsyncSpi` interface: `Samd21.SpiPorts`
-request ports (`SpiWriteRead`, one per attached device / chip select) with matching
-`SpiReply` completion ports. A request clocks one full-duplex frame — the write and
+`Samd21::SpiDriver` implements the F Prime `Drv.AsyncGuardedSpi` interface:
+`Drv.AsyncSpiCfg.SpiDriverPorts` request ports (`SpiWriteRead`, one per attached device /
+chip select) with matching `SpiWriteReadComplete` completion ports, delivered in main
+context from `schedIn`. A request clocks one full-duplex frame — the write and
 read buffers must be the same length — using two `Samd21.DmaDriver` channels (MISO
 armed first, then MOSI, which starts the clock). The completion is reported when
 both DMA channels have finished.
@@ -48,35 +49,48 @@ selects on `FPRIME_PLATFORM`.
 
 | Kind | Name | Type | Notes |
 | ---- | ---- | ---- | ----- |
-| sync input | `SpiWriteRead[SpiPorts]` | `Samd21.SpiWriteRead` | from `Samd21.AsyncSpi` |
-| output | `SpiReply[SpiPorts]` | `Samd21.SpiReply` | **ISR context** on success; synchronous on busy reject |
+| guarded input | `SpiWriteRead[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.SpiWriteReadRequest` | from `Drv.AsyncGuardedSpi`; index = chip-select slot |
+| output | `SpiWriteReadComplete[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.SpiWriteReadCallback` | **main context**, from `schedIn`; exactly one per request |
+| sync input | `schedIn` | `Svc.Sched` | **required**: delivers latched completions and refusals |
 | output | `dmaTransactionOut[DmaChannel.N]` | `Dma.Transaction` | `MOSI`, `MISO` |
 | output | `dmaTransactionAbortOut[DmaChannel.N]` | `Fw.Signal` | abort a stream after a receive overrun; **ISR context** |
-| sync input | `dmaReplyIn[DmaChannel.N]` | `Dma.TransactionReply` | **ISR context** |
-| output | `chipSelectGpioOut[SpiPorts]` | `Drv.GpioWrite` | software chip select only |
+| sync input | `dmaReplyIn[DmaChannel.N]` | `Dma.TransactionReply` | **ISR context**: latches only |
+| output | `chipSelectGpioOut[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.GpioWrite` | software chip select only |
 
-### 3.2 Configuration (`configure()`)
+`Drv.AsyncSpiCfg.SpiDriverPorts` (F Prime default 10) should be overridden in the project
+configuration to the number of chip selects wired: each slot costs two port objects and one
+pending-reply record (`fprime-samd-reference` uses 4).
+
+### 3.2 Configuration (`configure()`, `setBaudRate()`)
 
 `configure(sercom, baud_rate_khz, DataOrder, ClockPolarity, ClockPhase, DataInPinout,
 DataOutPinout, RunInStandby, HardwareChipSelect)` — called once from a `configComponents`
 phase. The caller routes the pads (`Samd21::PinMux::configure`) and configures the
 chip-select GPIO as an output **before** this call, because `configure()` deasserts
 every connected software chip select. The GCLK core clock (`F_CPU`) is the baud reference.
+`setBaudRate(baud_rate_khz)` changes SCK afterwards (SD cards: slow identification, fast data);
+it disables the SERCOM, rewrites the enable-protected `BAUD` and re-enables, and asserts when
+called before `configure()` or with a transfer in flight.
 
 ### 3.3 Transaction behaviour
 
 ```
-SpiWriteRead[p] ─▶ busy? ──yes──▶ SpiReply[p](SPI_OTHER_ERR)   (synchronous)
-                     │no
-                     ▼
-            CS[p] LOW (sw) → DMA MISO (DATA → read) → DMA MOSI (write → DATA)
-                     ▼ (ISR) dmaReplyIn[MISO], dmaReplyIn[MOSI] in either order
-            both done → CS[p] HIGH → SpiReply[p](SPI_OK)         (ISR context)
+SpiWriteRead[p] ─▶ unconfigured? ─▶ latch (p, SPI_CONFIG_ERR)
+                   busy?         ─▶ latch (p, SPI_BUSY_ERR)        no DMA, no chip select
+                   else: CS[p] LOW (sw) → DMA MISO (DATA → read) → DMA MOSI (write → DATA)
+   (ISR) dmaReplyIn[MISO], dmaReplyIn[MOSI] in either order; both done → CS[p] HIGH → latch (p, SPI_OK)
+   (ISR) SERCOM ERROR/BUFOVF → abort outstanding stream(s) → CS[p] HIGH → latch (p, SPI_OTHER_ERR)
+schedIn ─▶ for every slot with a latched reply (copied and cleared under CriticalSection):
+           SpiWriteReadComplete[p](write, read, status)            main context
 ```
 
-The reply is emitted from the DMAC ISR. Reply handlers must only latch state; in
-particular they must **not** queue a new SPI transaction from inside the callback
-(see `Samd21.DmaDriver` SDD §3.4.2 and `Fram.FramDriver` for the main-context hop).
+Nothing is delivered from an ISR or from inside the request call: the ISR paths and the
+refusals only write the slot's pending record; `schedIn` (one pass per cycler turn through
+`Svc.PassiveSchedAdapter`, or a rate group) emits the callbacks with interrupts enabled, so a
+client may start its next transfer from inside the callback. A slot holds one pending reply:
+a client must wait for its completion before issuing again on the same slot (asserted, as a
+software protocol error). Stray DMA replies (nothing in flight, duplicate channel, unknown
+channel) are ignored — the driver never asserts in response to bus traffic.
 
 ### 3.4 Error handling
 
@@ -89,18 +103,30 @@ never reach its count and, without intervention, the transaction never completes
 outstanding stream(s) through `dmaTransactionAbortOut` (the DMA driver clears the
 channel's pending flags and raises no reply), acknowledges the overflow (bounded wait for
 `TXC` so the character still in the shifter cannot land after the drain, write-1-clear
-`BUFOVF`, drain `DATA`, clear `TXC`/`ERROR`), deasserts the software chip select and emits
-`SpiReply` with `SPI_OTHER_ERR` and the caller's buffers. The SERCOM and DMAC interrupts share the lowest
-NVIC priority, so neither handler preempts the other inside the driver. The reply is in
-ISR context, like the success path. A busy reject (synchronous) and an overrun (ISR) both
-use `SPI_OTHER_ERR`; `Drv.SpiStatus` has no finer value for a receive fault.
+`BUFOVF`, drain `DATA`, clear `TXC`/`ERROR`), deasserts the software chip select and latches
+`SPI_OTHER_ERR` with the caller's buffers for the next `schedIn`. The SERCOM and DMAC
+interrupts share the lowest NVIC priority, so neither handler preempts the other inside the
+driver.
 
 Nothing in the stack detects a transfer that produces no clock at all (e.g. SERCOM clock
 gated); that failure mode has not been observed and a tick-based timeout is left for §6.
 
 The DMA status is not currently folded into the reply (DMA bus errors surface as
 `Samd21.DmaDriver` ISR replies with `BUS_ERROR`; the SPI reply remains `SPI_OK`) — see
-§6. Programming errors (unconfigured, size mismatch, stray DMA reply, reconfigure) assert.
+§6. Caller programming errors (size mismatch, > 65535 bytes, reconfigure, re-request on a
+slot with an undelivered reply, `setBaudRate` while busy) assert.
+
+### 3.5 Tested configurations
+
+| Board / device | SERCOM, pads | SCK | Mode | Chip select | Result |
+| --- | --- | --- | --- | --- | --- |
+| SAMD21 Curiosity Nano + Infineon CY15B102QN F-RAM | SERCOM1, MOSI PA16 / SCK PA17 / MISO PA19 | 1 MHz | 0, 3 | software (PA18) | pass |
+| same | same | 4 MHz | 0 | software | pass (qualification speed of `Fram.FramDriver`) |
+| same | same | 12 MHz | 0 | software | functional; receive overruns under DMA contention, every one recovered (33 in 150 s) |
+
+Limitations: hardware chip select, modes 1 and 2, LSB-first order, 9-bit characters and
+SERCOMs other than 1 are implemented from the data sheet but not exercised on hardware; one
+transfer at a time per driver (no queueing across slots); ≤ 65535 bytes per transfer.
 
 ## 4. Integration
 
@@ -109,19 +135,19 @@ channels, a `Samd21.GpioDriver` chip select, and the `configComponents` phase.
 
 ## 5. Unit tests
 
-`test/ut/` runs natively against the stub HAL: configuration in both chip-select modes,
-reconfigure assert, request before configure, nominal transactions in both DMA completion
-orders on every port, busy rejection on the same and other ports, hardware chip select,
-size mismatch, stray/duplicate DMA replies, BAUD boundaries and overflow, 500
-randomized transactions, and the receive-overrun path (both streams outstanding, one
-stream outstanding, spurious interrupt, overrun while idle, recovery on every port and in
+`test/ut/` runs natively against the stub HAL (17 tests): configuration in both chip-select
+modes, reconfigure assert, request before configure (`SPI_CONFIG_ERR` via `schedIn`), nominal
+transactions in both DMA completion orders on every slot, busy refusal on another slot
+(`SPI_BUSY_ERR`, delivered by `schedIn`, re-request on the slot asserts), hardware chip
+select, size mismatch, stray/duplicate/late DMA replies ignored, `schedIn` with nothing
+pending, `setBaudRate` (idle, before configure, while busy), BAUD boundaries and overflow,
+500 randomized transactions, and the receive-overrun path (both streams outstanding, one
+stream outstanding, spurious interrupt, overrun while idle, recovery on every slot and in
 both chip-select modes) driven through the stub HAL's `fireIsr()`.
 
 ## 6. Future work
 
-- Propagate DMA `BUS_ERROR` into `SpiReply` as `SPI_WRITE_ERR`/`SPI_OTHER_ERR`.
+- Propagate DMA `BUS_ERROR` into `SpiWriteReadComplete` as `SPI_WRITE_ERR`/`SPI_OTHER_ERR`.
 - A tick-based completion timeout for faults that raise no SERCOM flag (none observed).
 - Raise the MISO channel above the MOSI/UART channels in DMAC priority so the overrun
   does not occur in the first place at high SCK rates.
-- A main-context completion option (`activeIn`), mirroring `Samd21.I2cDriver`, so
-  clients need not implement the hop themselves.

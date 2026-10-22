@@ -10,7 +10,6 @@
 #include "fprime-samd/Drv/SpiDriver/SpiDriverGTestBase.hpp"
 #include "fprime-samd/Drv/SpiDriver/SpiDriverHardware.hpp"
 #include "fprime-samd/Drv/SpiDriver/SpiDriver_DmaChannelEnumAc.hpp"
-#include "samd-config/FppConstantsAc.hpp"
 
 namespace Samd21 {
 
@@ -87,6 +86,8 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     void testReceiveOverrunAfterTxComplete();
     void testSpuriousInterrupt();
     void testReceiveOverrunIdle();
+    void testSetBaudRate();
+    void testSchedIdle();
 
   private:
     // ----------------------------------------------------------------------
@@ -94,10 +95,10 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     // generated history does not record)
     // ----------------------------------------------------------------------
 
-    void from_SpiReply_handler(FwIndexType portNum,
-                               Fw::Buffer& writeBuffer,
-                               Fw::Buffer& readBuffer,
-                               const Drv::SpiStatus& status) override;
+    void from_SpiWriteReadComplete_handler(FwIndexType portNum,
+                                           Fw::Buffer& writeBuffer,
+                                           Fw::Buffer& readBuffer,
+                                           const Drv::SpiStatus& status) override;
 
     Drv::GpioStatus from_chipSelectGpioOut_handler(FwIndexType portNum, const Fw::Logic& state) override;
     void from_dmaTransactionAbortOut_handler(FwIndexType portNum) override;
@@ -161,10 +162,10 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     SpiDriver component;
 
     //! Request buffers (one pair per port so busy tests can overlap requests)
-    U8 m_writeData[Samd21::SpiPorts][MAX_TEST_SIZE];
-    U8 m_readData[Samd21::SpiPorts][MAX_TEST_SIZE];
-    Fw::Buffer m_writeBuffer[Samd21::SpiPorts];
-    Fw::Buffer m_readBuffer[Samd21::SpiPorts];
+    U8 m_writeData[Samd21::SpiDriver::NUM_SPIWRITEREAD_INPUT_PORTS][MAX_TEST_SIZE];
+    U8 m_readData[Samd21::SpiDriver::NUM_SPIWRITEREAD_INPUT_PORTS][MAX_TEST_SIZE];
+    Fw::Buffer m_writeBuffer[Samd21::SpiDriver::NUM_SPIWRITEREAD_INPUT_PORTS];
+    Fw::Buffer m_readBuffer[Samd21::SpiDriver::NUM_SPIWRITEREAD_INPUT_PORTS];
 
     //! Port indices seen on the from ports, parallel to the generated histories
     FwIndexType m_replyPorts[MAX_HISTORY_SIZE];

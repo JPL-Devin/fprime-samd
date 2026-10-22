@@ -12,6 +12,7 @@
 #include "config/FwIndexTypeAliasAc.h"
 #include "fprime-samd/Drv/SpiDriver/SpiDriverHardware.hpp"
 #include "fprime-samd/Drv/SpiDriver/SpiDriver_DmaChannelEnumAc.hpp"
+#include "fprime-samd/Drv/Types/CriticalSection.hpp"
 #include "fprime-samd/Drv/Types/Sercom.hpp"
 #include "fprime-samd/Drv/Types/SercomKindEnumAc.hpp"
 #include "fprime-samd/Drv/Types/ThinBuffer.hpp"
@@ -49,7 +50,13 @@ SpiDriver ::SpiDriver(const char* const compName)
       m_write(),
       m_configured(false),
       m_busy(0),
-      m_hardware_chip_select(false) {}
+      m_hardware_chip_select(false),
+      m_pending() {
+    for (FwIndexType i = 0; i < NUM_SPIWRITEREAD_INPUT_PORTS; i++) {
+        this->m_pending[i].status = Drv::SpiStatus::SPI_OK;
+        this->m_pending[i].pending = false;
+    }
+}
 
 SpiDriver ::~SpiDriver() {}
 
@@ -87,11 +94,15 @@ void SpiDriver ::configure(SercomKind sercom,
 
     // Register for the ERROR interrupt that configure() enables below
     SpiHardware::SpiHal::registerIsr(sercom, SpiDriver::s_spiDriverIsrHandler, this);
-
     SpiHardware::SpiHal::configure(sercom, baud_rate_khz, data_order, clock_polarity, clock_phase, data_in_pinout,
                                    data_out_pinout, run_in_standby, hardware_chipselect);
-
     this->m_configured = true;
+}
+
+void SpiDriver ::setBaudRate(U32 baud_rate_khz) {
+    FW_ASSERT(this->m_configured, this->m_sercom);
+    FW_ASSERT(this->m_busy == 0, this->m_sercom, this->m_busy);
+    SpiHardware::SpiHal::setBaudRate(this->m_sercom, baud_rate_khz);
 }
 
 // ----------------------------------------------------------------------
@@ -99,22 +110,25 @@ void SpiDriver ::configure(SercomKind sercom,
 // ----------------------------------------------------------------------
 
 void SpiDriver ::SpiWriteRead_handler(FwIndexType portNum, Fw::Buffer& writeBuffer, Fw::Buffer& readBuffer) {
-    FW_ASSERT(this->m_configured, this->m_sercom);
+    // Caller contract (not a hardware condition): both streams clock the same number of bytes
     FW_ASSERT(writeBuffer.getSize() == readBuffer.getSize(), writeBuffer.getSize(), readBuffer.getSize());
-    FW_ASSERT(writeBuffer.getSize() <= 0xFFFF);  // We don't actually have this much memory but I'll check it anyway...
-
-    if (this->m_busy != 0) {
-        if (this->isConnected_SpiReply_OutputPort(portNum)) {
-            this->SpiReply_out(portNum, writeBuffer, readBuffer, Drv::SpiStatus::SPI_OTHER_ERR);
-        }
-
+    FW_ASSERT(writeBuffer.getSize() <= 0xFFFF);  // DMA block transfer count is 16 bits
+    if (!this->m_configured) {
+        this->latchReply(portNum, writeBuffer, readBuffer, Drv::SpiStatus::SPI_CONFIG_ERR);
         return;
     }
-
-    this->m_portNum = portNum;
-    this->m_busy = BusyBit::RX_BUSY | BusyBit::TX_BUSY;
-    this->m_read = Samd21::ThinBuffer(readBuffer);
-    this->m_write = Samd21::ThinBuffer(writeBuffer);
+    {
+        // m_busy is cleared by the ISR paths; decide and claim the bus atomically
+        Samd21::CriticalSection cs;
+        if (this->m_busy != 0) {
+            this->latchReply(portNum, writeBuffer, readBuffer, Drv::SpiStatus::SPI_BUSY_ERR);
+            return;
+        }
+        this->m_portNum = portNum;
+        this->m_busy = BusyBit::RX_BUSY | BusyBit::TX_BUSY;
+        this->m_read = Samd21::ThinBuffer(readBuffer);
+        this->m_write = Samd21::ThinBuffer(writeBuffer);
+    }
 
     if (!this->m_hardware_chip_select) {
         if (this->isConnected_chipSelectGpioOut_OutputPort(this->m_portNum)) {
@@ -139,36 +153,44 @@ void SpiDriver ::SpiWriteRead_handler(FwIndexType portNum, Fw::Buffer& writeBuff
         true, false, Samd21::Dma::AddressIncrementStepSize::SIZE_1, Samd21::Dma::StepSelection::SOURCE);
 }
 
-void SpiDriver ::dmaReplyIn_handler(FwIndexType portNum, const Samd21::Dma::Reply& reply) {
-    // We will get two replies (Tx, Rx) but the order is not guarenteed since they should finish at the same time.
-    // We should reply to the transaction after we got both of the replies back
-    FW_ASSERT(this->m_configured, this->m_sercom, this->m_portNum);
-    FW_ASSERT(this->m_busy != 0, this->m_sercom, this->m_portNum, portNum,
-              static_cast<FwAssertArgType>(reply.get_status()));
-
-    if (portNum == SpiDriver_DmaChannel::MISO) {
-        FW_ASSERT(this->m_busy & BusyBit::RX_BUSY, this->m_sercom, portNum);
-        this->m_busy &= ~BusyBit::RX_BUSY;
-    } else if (portNum == SpiDriver_DmaChannel::MOSI) {
-        FW_ASSERT(this->m_busy & BusyBit::TX_BUSY, this->m_sercom, portNum);
-        this->m_busy &= ~BusyBit::TX_BUSY;
-    } else {
-        // What is this port?
-        FW_ASSERT(false, this->m_sercom, portNum);
-    }
-
-    // Reply if both bufferrs were received
-    if (!this->m_busy) {
-        auto read = this->m_read.getBuffer();
-        auto write = this->m_write.getBuffer();
-
-        if (!this->m_hardware_chip_select) {
-            if (this->isConnected_chipSelectGpioOut_OutputPort(this->m_portNum)) {
-                this->chipSelectGpioOut_out(this->m_portNum, Fw::Logic::HIGH);
+void SpiDriver ::schedIn_handler(FwIndexType portNum, U32 context) {
+    for (FwIndexType slot = 0; slot < NUM_SPIWRITEREAD_INPUT_PORTS; slot++) {
+        PendingReply reply;
+        {
+            // The ISR paths write the record; copy and clear it with interrupts masked, then
+            // call the client with them enabled (the callback may start the next transfer).
+            Samd21::CriticalSection cs;
+            if (!this->m_pending[slot].pending) {
+                continue;
             }
+            reply = this->m_pending[slot];
+            this->m_pending[slot].pending = false;
         }
+        Fw::Buffer write = reply.write.getBuffer();
+        Fw::Buffer read = reply.read.getBuffer();
+        if (this->isConnected_SpiWriteReadComplete_OutputPort(slot)) {
+            this->SpiWriteReadComplete_out(slot, write, read, reply.status);
+        }
+    }
+}
 
-        this->SpiReply_out(this->m_portNum, write, read, Drv::SpiStatus::SPI_OK);
+void SpiDriver ::dmaReplyIn_handler(FwIndexType portNum, const Samd21::Dma::Reply& reply) {
+    // Two replies (Tx, Rx) arrive in either order; the transfer is done when both are in.
+    // A reply with nothing in flight, or for an unknown channel, cannot be acted on: it is
+    // dropped rather than asserted on (no assert in response to bus traffic).
+    if (this->m_busy == 0) {
+        return;
+    }
+    if (portNum == SpiDriver_DmaChannel::MISO) {
+        this->m_busy &= static_cast<U8>(~BusyBit::RX_BUSY);
+    } else if (portNum == SpiDriver_DmaChannel::MOSI) {
+        this->m_busy &= static_cast<U8>(~BusyBit::TX_BUSY);
+    } else {
+        return;
+    }
+    if (this->m_busy == 0) {
+        this->deassertChipSelect();
+        this->latchReply(this->m_portNum, this->m_write.getBuffer(), this->m_read.getBuffer(), Drv::SpiStatus::SPI_OK);
     }
 }
 
@@ -178,7 +200,6 @@ void SpiDriver ::dmaReplyIn_handler(FwIndexType portNum, const Samd21::Dma::Repl
 
 void SpiDriver ::s_spiDriverIsrHandler(Fw::PassiveComponentBase* spiDriverRaw, SercomKind sercom) {
     auto spiDriver = reinterpret_cast<SpiDriver*>(spiDriverRaw);
-
     FW_ASSERT(spiDriver != nullptr);
     FW_ASSERT(sercom == spiDriver->m_sercom, sercom, spiDriver->m_sercom);
     spiDriver->isrHandler();
@@ -191,7 +212,6 @@ void SpiDriver ::isrHandler() {
         // ERROR is the only interrupt enabled; anything else is spurious
         return;
     }
-
     // Stop the DMA streams that have not completed before touching the peripheral, so
     // no further characters are pushed while the receiver is drained. The DMA driver
     // raises no reply for an aborted channel and clears its pending flags, so no stale
@@ -202,27 +222,44 @@ void SpiDriver ::isrHandler() {
     if (this->m_busy & BusyBit::TX_BUSY) {
         this->dmaTransactionAbortOut_out(SpiDriver_DmaChannel::MOSI);
     }
-
     // Let the shifter finish, drain the receiver and clear the flags so the interrupt
     // cannot re-fire and the next transfer starts on an empty receive buffer.
     SpiHardware::SpiHal::acknowledgeError(this->m_sercom);
-
     if (this->m_busy == 0) {
         // Nothing in flight to fail (the transfer finished before the flag was seen)
         return;
     }
     this->m_busy = 0;
+    this->deassertChipSelect();
+    this->latchReply(this->m_portNum, this->m_write.getBuffer(), this->m_read.getBuffer(),
+                     Drv::SpiStatus::SPI_OTHER_ERR);
+}
 
-    auto read = this->m_read.getBuffer();
-    auto write = this->m_write.getBuffer();
+// ----------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------
 
+void SpiDriver ::deassertChipSelect() {
     if (!this->m_hardware_chip_select) {
         if (this->isConnected_chipSelectGpioOut_OutputPort(this->m_portNum)) {
             this->chipSelectGpioOut_out(this->m_portNum, Fw::Logic::HIGH);
         }
     }
+}
 
-    this->SpiReply_out(this->m_portNum, write, read, Drv::SpiStatus::SPI_OTHER_ERR);
+void SpiDriver ::latchReply(FwIndexType portNum,
+                            const Fw::Buffer& writeBuffer,
+                            const Fw::Buffer& readBuffer,
+                            Drv::SpiStatus::T status) {
+    FW_ASSERT(portNum >= 0 && portNum < NUM_SPIWRITEREAD_INPUT_PORTS, portNum);
+    PendingReply& slot = this->m_pending[portNum];
+    // A client owns one request at a time per slot: the previous completion must have been
+    // delivered before it asks again (software protocol, hence an assertion).
+    FW_ASSERT(!slot.pending, portNum, static_cast<FwAssertArgType>(slot.status));
+    slot.write = Samd21::ThinBuffer(writeBuffer);
+    slot.read = Samd21::ThinBuffer(readBuffer);
+    slot.status = status;
+    slot.pending = true;
 }
 
 }  // namespace Samd21

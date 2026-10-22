@@ -47,6 +47,10 @@ struct SpiHal {
                           SpiDriver::HardwareChipSelect hardware_chipselect);
 
     //! Address of the SERCOM SPI DATA register (DMA source for MISO, destination for MOSI).
+    //! Change SCK rate after configure(): disables the SERCOM (BAUD is enable-protected,
+    //! §27.6.2.1), writes BAUD and re-enables it. Only legal while no transfer is in flight.
+    static void setBaudRate(SercomKind sercom, U32 baud_rate_khz);
+
     static U32 getDataRegisterAddress(SercomKind sercom);
 
     //! Read the error interrupt state (INTFLAG.ERROR, STATUS.BUFOVF). ISR context.
@@ -89,6 +93,7 @@ struct StubState {
 
     // acknowledgeError() capture
     U32 acknowledge_error_count;
+    U32 set_baud_count;
 };
 
 //! Invoke the registered ISR callback as the SERCOM interrupt would
