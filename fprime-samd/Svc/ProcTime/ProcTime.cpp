@@ -1,14 +1,15 @@
 // ======================================================================
-// \title  Samd21Time.cpp
+// \title  ProcTime.cpp
 // \author tumbar
-// \brief  cpp file for Samd21Time component implementation class
+// \brief  cpp file for ProcTime component implementation class
 // ======================================================================
 
-#include "fprime-samd/Svc/Samd21Time/Samd21Time.hpp"
+#include "fprime-samd/Svc/ProcTime/ProcTime.hpp"
 #include "Fw/Time/Time.hpp"
 #include "Fw/Time/TimeInterval.hpp"
 #include "Fw/Types/Assert.hpp"
 #include "Os/RawTime.hpp"
+#include "config/OsSelection.hpp"
 
 namespace Samd21 {
 
@@ -16,34 +17,26 @@ namespace Samd21 {
 // Component construction and destruction
 // ----------------------------------------------------------------------
 
-Samd21Time ::Samd21Time(const char* const compName) : Samd21TimeComponentBase(compName), m_proc_ref_time() {}
+ProcTime::ProcTime(const char* const compName) : ProcTimeComponentBase(compName) {}
 
-Samd21Time ::~Samd21Time() {}
+ProcTime::~ProcTime() {}
 
 // ----------------------------------------------------------------------
 // Handler implementations for typed input ports
 // ----------------------------------------------------------------------
 
-void Samd21Time ::getTime_handler(FwIndexType portNum, Fw::Time& time) {
+void ProcTime::getTime_handler(FwIndexType portNum, Fw::Time& time) {
     Os::RawTime now;
     auto status = now.now();
     FW_ASSERT(status == Os::RawTimeInterface::Status::OP_OK, status);
 
+    const Os::RawTime ref_time;
+
     Fw::TimeInterval proc_time;
-    status = now.getTimeInterval(m_proc_ref_time, proc_time);
+    status = now.getTimeInterval(ref_time, proc_time);
     FW_ASSERT(status == Os::RawTimeInterface::Status::OP_OK, status);
 
-    // TODO(tumbar) Use the SC time rather than the PROC time when configured
     time = Fw::Time(TimeBase::TB_PROC_TIME, proc_time.getSeconds(), proc_time.getUSeconds());
-}
-
-// ----------------------------------------------------------------------
-// Handler implementations for commands
-// ----------------------------------------------------------------------
-
-void Samd21Time ::SET_TIME_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, const Fw::TimeValue& value) {
-    // TODO
-    this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
 }
 
 }  // namespace Samd21

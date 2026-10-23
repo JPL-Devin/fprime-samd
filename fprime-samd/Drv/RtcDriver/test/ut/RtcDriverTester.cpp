@@ -6,7 +6,6 @@
 
 #include "fprime-samd/Drv/RtcDriver/test/ut/RtcDriverTester.hpp"
 #include "Fw/Test/UnitTest.hpp"
-#include "Fw/Types/SerialBuffer.hpp"
 #include "STest/Pick/Pick.hpp"
 #include "fprime-samd/Drv/RtcDriver/RawTime.hpp"
 
@@ -104,6 +103,38 @@ void RtcDriverTester::testConfigure() {
     }
 }
 
+void RtcDriverTester::testConfigureAssertsOnDoubleConfigure() {
+    REQUIREMENT("SAMD21-RTC-001: The RtcDriver shall configure the RTC peripheral for periodic interrupts");
+
+    this->resetTest();
+
+    this->component.configure(RtcDriver::ClockSource::InternalOscillator, RtcDriver::TickRate::TICK_1_HZ);
+
+    // Configuring a second time without resetting the hardware state is a programming error
+    ASSERT_DEATH_IF_SUPPORTED(
+        this->component.configure(RtcDriver::ClockSource::InternalOscillator, RtcDriver::TickRate::TICK_1_HZ),
+        "Assert:");
+}
+
+void RtcDriverTester::testConfigureAssertsOnInvalidRate() {
+    REQUIREMENT("SAMD21-RTC-002: The RtcDriver shall support configurable interrupt periods (1-128 Hz)");
+
+    this->resetTest();
+
+    const RtcDriver::TickRate invalid_rate = static_cast<RtcDriver::TickRate>(3);
+    ASSERT_DEATH_IF_SUPPORTED(this->component.configure(RtcDriver::ClockSource::InternalOscillator, invalid_rate),
+                              "Assert:");
+}
+
+void RtcDriverTester::testConfigureAssertsOnInvalidClockSource() {
+    REQUIREMENT("SAMD21-RTC-005: The RtcDriver shall support internal, external, and ULP clock sources");
+
+    this->resetTest();
+
+    const RtcDriver::ClockSource invalid_source = static_cast<RtcDriver::ClockSource>(99);
+    ASSERT_DEATH_IF_SUPPORTED(this->component.configure(invalid_source, RtcDriver::TickRate::TICK_1_HZ), "Assert:");
+}
+
 void RtcDriverTester::testEnable() {
     REQUIREMENT("SAMD21-RTC-001: The RtcDriver shall configure the RTC peripheral for periodic interrupts");
 
@@ -118,6 +149,15 @@ void RtcDriverTester::testEnable() {
     // Verify state indicates configuration is complete
     const RtcHardware::RtcState& state = RtcHardware::getRtcState();
     ASSERT_TRUE(state.configured);
+}
+
+void RtcDriverTester::testEnableAssertsWhenNotConfigured() {
+    REQUIREMENT("SAMD21-RTC-001: The RtcDriver shall configure the RTC peripheral for periodic interrupts");
+
+    this->resetTest();
+
+    // Enabling before configure() is a programming error
+    ASSERT_DEATH_IF_SUPPORTED(this->component.enable(), "Assert:");
 }
 
 void RtcDriverTester::testCycle() {
@@ -150,6 +190,30 @@ void RtcDriverTester::testCycle() {
     ASSERT_EQ(state.deadline_exceeded, 0U);
 }
 
+void RtcDriverTester::testCycleNoInterruptPending() {
+    REQUIREMENT("SAMD21-RTC-004: The RtcDriver shall detect RTC interrupts via activeIn port");
+
+    this->resetTest();
+
+    // Configure and enable
+    this->component.configure(RtcDriver::ClockSource::InternalOscillator, RtcDriver::TickRate::TICK_1_HZ);
+    this->component.enable();
+
+    // No RTC interrupt has fired, so wakeup_interrupt is false: the handler should
+    // acknowledge the ISR tick but report that no cycle work was done, and emit nothing.
+    RtcHardware::RtcState& state = RtcHardware::getRtcState();
+    state.deadline_reached = true;
+
+    bool didWork = this->invoke_to_activeIn(0, 0);
+    EXPECT_FALSE(didWork);
+
+    ASSERT_FROM_PORT_HISTORY_SIZE(0);
+    ASSERT_TLM_SIZE(0);
+
+    // The ISR acknowledgement still happens unconditionally
+    ASSERT_TRUE(state.deadline_reached);
+}
+
 void RtcDriverTester::testCycleOverrun() {
     REQUIREMENT("SAMD21-RTC-008: The RtcDriver shall detect when processing exceeds the configured period");
 
@@ -176,6 +240,30 @@ void RtcDriverTester::testCycleOverrun() {
 
     // Verify state shows overrun
     ASSERT_EQ(state.deadline_exceeded, 1U);
+}
+
+void RtcDriverTester::testCycleOverrunAccumulates() {
+    REQUIREMENT("SAMD21-RTC-008: The RtcDriver shall detect when processing exceeds the configured period");
+
+    this->resetTest();
+
+    this->component.configure(RtcDriver::ClockSource::InternalOscillator, RtcDriver::TickRate::TICK_1_HZ);
+    this->component.enable();
+
+    RtcHardware::RtcState& state = RtcHardware::getRtcState();
+
+    // Three consecutive missed deadlines should accumulate rather than reset
+    for (U16 i = 1; i <= 3; i++) {
+        state.deadline_reached = false;
+        this->simulateRtcInterrupt();
+        this->invoke_to_activeIn(0, static_cast<U32>(i));
+        ASSERT_EQ(state.deadline_exceeded, i);
+    }
+
+    // Three overrun cycles should have reported three increasing telemetry values
+    ASSERT_TLM_SIZE(3);
+    ASSERT_TLM_CycleOverrun_SIZE(3);
+    ASSERT_TLM_CycleOverrun(2, 3);
 }
 
 void RtcDriverTester::testMultipleCycles() {
@@ -323,98 +411,45 @@ void RtcDriverTester::testTimeNowFunction() {
     ASSERT_EQ(time.m_micros, 0U);
 }
 
-void RtcDriverTester::testSamd21RawTimeNow() {
+void RtcDriverTester::testTimeInterval() {
     REQUIREMENT(
-        "SAMD21-RTC-007: The RtcDriver shall provide an Os::RawTime implementation (Samd21RawTime::now() "
-        "populates the handle)");
+        "SAMD21-RTC-007: The RtcDriver shall provide an Os::RawTime implementation (timeInterval() computes the "
+        "absolute difference between two times)");
 
-    this->resetTest();
+    Os::Samd21::Samd21RawTimeHandle a;
+    Os::Samd21::Samd21RawTimeHandle b;
 
-    // Configure and enable
-    this->component.configure(RtcDriver::ClockSource::InternalOscillator, RtcDriver::TickRate::TICK_1_HZ);
-    this->component.enable();
+    // Test 1: Identical times
+    a.m_seconds = 10;
+    a.m_micros = 500000;
+    b = a;
+    Fw::TimeInterval interval = Os::Samd21::timeInterval(a, b);
+    ASSERT_EQ(interval.getSeconds(), 0U);
+    ASSERT_EQ(interval.getUSeconds(), 0U);
 
-    RtcHardware::RtcState& state = RtcHardware::getRtcState();
+    // Test 2: No microsecond borrow, independent of argument order
+    b.m_seconds = 12;
+    b.m_micros = 750000;
+    interval = Os::Samd21::timeInterval(a, b);
+    ASSERT_EQ(interval.getSeconds(), 2U);
+    ASSERT_EQ(interval.getUSeconds(), 250000U);
+    interval = Os::Samd21::timeInterval(b, a);
+    ASSERT_EQ(interval.getSeconds(), 2U);
+    ASSERT_EQ(interval.getUSeconds(), 250000U);
 
-    // Set known time state
-    state.n_ticks = 42;
-    this->setRtcCounter(16384);  // Half second
+    // Test 3: Microsecond borrow from seconds
+    b.m_seconds = 12;
+    b.m_micros = 250000;
+    interval = Os::Samd21::timeInterval(a, b);
+    ASSERT_EQ(interval.getSeconds(), 1U);
+    ASSERT_EQ(interval.getUSeconds(), 750000U);
 
-    // Create Samd21RawTime instance and call now()
-    Os::Samd21::RawTime rawTime;
-    Os::RawTime::Status status = rawTime.now();
-
-    // Verify success
-    ASSERT_EQ(status, Os::RawTime::Status::OP_OK);
-
-    // Verify handle was populated correctly
-    Os::RawTimeHandle* handle = rawTime.getHandle();
-    Os::Samd21::Samd21RawTimeHandle* samd21Handle = static_cast<Os::Samd21::Samd21RawTimeHandle*>(handle);
-
-    ASSERT_EQ(samd21Handle->m_seconds, 42U);
-    ASSERT_GE(samd21Handle->m_micros, 490000U);
-    ASSERT_LE(samd21Handle->m_micros, 510000U);
-}
-
-void RtcDriverTester::testSamd21RawTimeSerialization() {
-    REQUIREMENT(
-        "SAMD21-RTC-007: The RtcDriver shall provide an Os::RawTime implementation (Samd21RawTime "
-        "serializes and deserializes in both endiannesses)");
-
-    this->resetTest();
-
-    // Configure and enable
-    this->component.configure(RtcDriver::ClockSource::InternalOscillator, RtcDriver::TickRate::TICK_1_HZ);
-    this->component.enable();
-
-    RtcHardware::RtcState& state = RtcHardware::getRtcState();
-
-    // Set known time state
-    state.n_ticks = 123;
-    this->setRtcCounter(8192);  // 0.25s
-
-    // Create and populate RawTime
-    Os::Samd21::RawTime originalTime;
-    ASSERT_EQ(originalTime.now(), Os::RawTime::Status::OP_OK);
-
-    // Serialize to buffer (big endian)
-    U8 buffer[FW_RAW_TIME_SERIALIZATION_MAX_SIZE];
-    Fw::SerialBuffer serBuffer(buffer, sizeof(buffer));
-
-    Fw::SerializeStatus serStatus = originalTime.serializeTo(serBuffer);
-    ASSERT_EQ(serStatus, Fw::SerializeStatus::FW_SERIALIZE_OK);
-
-    // Verify size (2x U32 = 8 bytes)
-    ASSERT_EQ(serBuffer.getSize(), 8U);
-
-    // Deserialize into new instance
-    Os::Samd21::RawTime deserializedTime;
-    serStatus = deserializedTime.deserializeFrom(serBuffer);
-    ASSERT_EQ(serStatus, Fw::SerializeStatus::FW_SERIALIZE_OK);
-
-    // Verify values match
-    Os::Samd21::Samd21RawTimeHandle* origHandle =
-        static_cast<Os::Samd21::Samd21RawTimeHandle*>(originalTime.getHandle());
-    Os::Samd21::Samd21RawTimeHandle* deserHandle =
-        static_cast<Os::Samd21::Samd21RawTimeHandle*>(deserializedTime.getHandle());
-
-    ASSERT_EQ(deserHandle->m_seconds, origHandle->m_seconds);
-    ASSERT_EQ(deserHandle->m_micros, origHandle->m_micros);
-
-    // Test little endian round-trip
-    serBuffer.resetSer();
-    serStatus = originalTime.serializeTo(serBuffer, Fw::Endianness::LITTLE);
-    ASSERT_EQ(serStatus, Fw::SerializeStatus::FW_SERIALIZE_OK);
-
-    Os::Samd21::RawTime littleEndianTime;
-    serStatus = littleEndianTime.deserializeFrom(serBuffer, Fw::Endianness::LITTLE);
-    ASSERT_EQ(serStatus, Fw::SerializeStatus::FW_SERIALIZE_OK);
-
-    Os::Samd21::Samd21RawTimeHandle* littleHandle =
-        static_cast<Os::Samd21::Samd21RawTimeHandle*>(littleEndianTime.getHandle());
-
-    ASSERT_EQ(littleHandle->m_seconds, origHandle->m_seconds);
-    ASSERT_EQ(littleHandle->m_micros, origHandle->m_micros);
+    // Test 4: Same second, newer determined by microseconds
+    b.m_seconds = 10;
+    b.m_micros = 100000;
+    interval = Os::Samd21::timeInterval(a, b);
+    ASSERT_EQ(interval.getSeconds(), 0U);
+    ASSERT_EQ(interval.getUSeconds(), 400000U);
 }
 
 }  // namespace Samd21
