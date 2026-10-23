@@ -15,7 +15,7 @@ if (FPRIME_PLATFORM STREQUAL "Samd21")
     set(SPI_HARDWARE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/SpiDriverHardware.cpp")
 else()
     # Linux/test build - use stub implementation
-    set(SPI_HARDWARE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/SpiDriverHardwareStub.cpp")
+    set(SPI_HARDWARE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/test/ut/SpiDriverHardwareStub.cpp")
 endif()
 
 register_fprime_library(
@@ -36,7 +36,7 @@ register_fprime_ut(
         "${CMAKE_CURRENT_LIST_DIR}/test/ut/SpiDriverTestMain.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/test/ut/SpiDriverTester.cpp"
         # Use stub hardware for unit tests
-        "${CMAKE_CURRENT_LIST_DIR}/SpiDriverHardwareStub.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/test/ut/SpiDriverHardwareStub.cpp"
     DEPENDS
         STest
     UT_AUTO_HELPERS
