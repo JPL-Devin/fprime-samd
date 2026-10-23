@@ -16,8 +16,12 @@ env:
   # The harness. `main` rather than a pinned SHA so a harness fix does not require a
   # commit here; the trade-off is that an unrelated harness regression can turn this red,
   # which the job log makes obvious because the failure is in the reference's own code.
-  HARNESS_REPO: fprime-community/fprime-samd-reference
-  HARNESS_REF: main
+  # TEMPORARY -- REVERT BEFORE MERGE (restore fprime-community/fprime-samd-reference @ main).
+  # fprime-samd-reference main pins a lib/fprime without nasa/fprime#6237 (Drv.AsyncGuardedSpi),
+  # which this PR's SpiDriver implements; until fprime-samd-reference#9 lands, build against
+  # that PR's branch so the harness carries the interface.
+  HARNESS_REPO: lestarch-autobot/fprime-samd-reference
+  HARNESS_REF: devin/1791242679-fram-driver
 
 jobs:
   native-ut:
