@@ -84,7 +84,7 @@ void SpiDriverTester ::testConfigureHardwareChipSelect() {
     // REQUIREMENT(SPI-CFG-003): with hardware chip select the GPIO ports are never driven
     this->clearAll();
     this->component.configure(TEST_SERCOM, TEST_BAUD_KHZ, SpiDriver::DataOrder::LSB, SpiDriver::ClockPolarity::IdleHigh,
-                              SpiDriver::ClockPhase::SampleOnRisingSck, SpiDriver::DataInPinout::PAD0,
+                              SpiDriver::ClockPhase::SampleOnTrailingSck, SpiDriver::DataInPinout::PAD0,
                               SpiDriver::DataOutPinout::MOSI_2_SCK_3_CS_1, SpiDriver::RunInStandby::ENABLED,
                               SpiDriver::HardwareChipSelect::ENABLED);
 
@@ -92,7 +92,7 @@ void SpiDriverTester ::testConfigureHardwareChipSelect() {
     ASSERT_EQ(stub.configure_count, 1U);
     ASSERT_EQ(stub.data_order, SpiDriver::DataOrder::LSB);
     ASSERT_EQ(stub.clock_polarity, SpiDriver::ClockPolarity::IdleHigh);
-    ASSERT_EQ(stub.clock_phase, SpiDriver::ClockPhase::SampleOnRisingSck);
+    ASSERT_EQ(stub.clock_phase, SpiDriver::ClockPhase::SampleOnTrailingSck);
     ASSERT_EQ(stub.data_in_pinout, SpiDriver::DataInPinout::PAD0);
     ASSERT_EQ(stub.data_out_pinout, SpiDriver::DataOutPinout::MOSI_2_SCK_3_CS_1);
     ASSERT_EQ(stub.run_in_standby, SpiDriver::RunInStandby::ENABLED);
@@ -145,17 +145,101 @@ void SpiDriverTester ::testBusy() {
     ASSERT_from_chipSelectGpioOut_SIZE(0);
     this->assertReply(1, Drv::SpiStatus::SPI_BUSY_ERR);
 
-    // A second request on a slot whose refusal has not been delivered yet is a client protocol error
-    this->invoke_to_SpiWriteRead(1, this->m_writeBuffer[1], this->m_readBuffer[1]);
-    ASSERT_DEATH_IF_SUPPORTED(this->invoke_to_SpiWriteRead(1, this->m_writeBuffer[1], this->m_readBuffer[1]), "");
+    // Another request on slot 1 is latched again; a request while that refusal is still
+    // undelivered is answered synchronously with SPI_BUSY_ERR (the slot already holds an
+    // outcome) -- never an assert
     this->clearAll();
+    this->invoke_to_SpiWriteRead(1, this->m_writeBuffer[1], this->m_readBuffer[1]);
+    ASSERT_from_SpiWriteReadComplete_SIZE(0);
+    this->invoke_to_SpiWriteRead(1, this->m_writeBuffer[1], this->m_readBuffer[1]);
+    ASSERT_from_SpiWriteReadComplete_SIZE(1);
+    ASSERT_EQ(this->m_replyPorts[0], 1);
+    ASSERT_EQ(this->fromPortHistory_SpiWriteReadComplete->at(0).status.e, Drv::SpiStatus::SPI_BUSY_ERR);
+    ASSERT_from_dmaTransactionOut_SIZE(0);
+    ASSERT_from_chipSelectGpioOut_SIZE(0);
+    this->clearAll();
+    // activeIn then delivers the one latched refusal
     this->invoke_to_activeIn(0, 0);
+    ASSERT_from_SpiWriteReadComplete_SIZE(1);
+    ASSERT_EQ(this->fromPortHistory_SpiWriteReadComplete->at(0).status.e, Drv::SpiStatus::SPI_BUSY_ERR);
     this->clearAll();
 
     // The original transfer completes normally afterwards
     this->finishTransaction(0, true);
     this->startTransaction(1, 3);
     this->finishTransaction(1, true);
+}
+
+void SpiDriverTester ::testSameSlotReRequest() {
+    // REQUIREMENT(SPI-XFER-003): a re-request on the slot whose transfer is in flight is answered
+    //                            synchronously with SPI_BUSY_ERR, generates no DMA or chip select
+    //                            traffic, never asserts, and the in-flight transfer still completes
+    this->configure(SpiDriver::HardwareChipSelect::DISABLED);
+    this->startTransaction(0, 8);
+    this->clearAll();
+    this->invoke_to_SpiWriteRead(0, this->m_writeBuffer[0], this->m_readBuffer[0]);
+    ASSERT_from_SpiWriteReadComplete_SIZE(1);
+    ASSERT_EQ(this->m_replyPorts[0], 0);
+    ASSERT_EQ(this->fromPortHistory_SpiWriteReadComplete->at(0).status.e, Drv::SpiStatus::SPI_BUSY_ERR);
+    ASSERT_from_dmaTransactionOut_SIZE(0);
+    ASSERT_from_chipSelectGpioOut_SIZE(0);
+    this->clearAll();
+    // Both DMA completions arrive before activeIn ran: the OK outcome latches without asserting
+    this->completeDma(SpiDriver_DmaChannel::MISO);
+    this->completeDma(SpiDriver_DmaChannel::MOSI);
+    this->assertChipSelect(0, 0, Fw::Logic::HIGH);
+    this->clearAll();
+    // A request on that slot before activeIn delivers the completion is also refused synchronously
+    this->invoke_to_SpiWriteRead(0, this->m_writeBuffer[0], this->m_readBuffer[0]);
+    ASSERT_from_SpiWriteReadComplete_SIZE(1);
+    ASSERT_EQ(this->fromPortHistory_SpiWriteReadComplete->at(0).status.e, Drv::SpiStatus::SPI_BUSY_ERR);
+    ASSERT_from_dmaTransactionOut_SIZE(0);
+    this->clearAll();
+    this->assertReply(0, Drv::SpiStatus::SPI_OK);
+    this->clearAll();
+    // And the slot is usable again
+    this->startTransaction(0, 3);
+    this->finishTransaction(0, false);
+}
+
+void SpiDriverTester ::testDmaBusError() {
+    // REQUIREMENT(SPI-ERR-005): BUS_ERROR on either stream -> abort the other, CS high, SPI_OTHER_ERR,
+    //                           and the driver accepts a new transaction afterwards
+    this->configure(SpiDriver::HardwareChipSelect::DISABLED);
+    const SpiDriver_DmaChannel::T channels[] = {SpiDriver_DmaChannel::MOSI, SpiDriver_DmaChannel::MISO};
+    for (FwIndexType i = 0; i < 2; i++) {
+        const SpiDriver_DmaChannel::T failing = channels[i];
+        const SpiDriver_DmaChannel::T other = channels[1 - i];
+        this->startTransaction(1, 8);
+        this->clearAll();
+        const Samd21::Dma::Reply reply(Samd21::Dma::Status::BUS_ERROR, 5);
+        this->invoke_to_dmaReplyIn(static_cast<FwIndexType>(failing), reply);
+        ASSERT_from_dmaTransactionAbortOut_SIZE(1);
+        this->assertAbort(0, other);
+        ASSERT_from_chipSelectGpioOut_SIZE(1);
+        this->assertChipSelect(0, 1, Fw::Logic::HIGH);
+        this->assertReply(1, Drv::SpiStatus::SPI_OTHER_ERR);
+        this->clearAll();
+        // No reply follows for the aborted stream; a late one would be ignored
+        this->completeDma(other);
+        this->invoke_to_activeIn(0, 0);
+        ASSERT_from_SpiWriteReadComplete_SIZE(0);
+        ASSERT_from_chipSelectGpioOut_SIZE(0);
+        this->clearAll();
+        // Bus is free again
+        this->startTransaction(0, 4);
+        this->finishTransaction(0, true);
+        this->clearAll();
+    }
+    // BUS_ERROR on the second completion (other stream already done) fails the transfer too
+    this->startTransaction(2, 6);
+    this->clearAll();
+    this->completeDma(SpiDriver_DmaChannel::MISO);
+    const Samd21::Dma::Reply reply(Samd21::Dma::Status::BUS_ERROR, 1);
+    this->invoke_to_dmaReplyIn(static_cast<FwIndexType>(SpiDriver_DmaChannel::MOSI), reply);
+    ASSERT_from_dmaTransactionAbortOut_SIZE(0);
+    this->assertChipSelect(0, 2, Fw::Logic::HIGH);
+    this->assertReply(2, Drv::SpiStatus::SPI_OTHER_ERR);
 }
 
 void SpiDriverTester ::testHardwareChipSelectTransaction() {

@@ -330,6 +330,9 @@ void DmaDriver::handleInterrupt() {
                 m_channels[id].restart(reinterpret_cast<DmacDescriptor*>(keep));
                 freeDescriptor(reinterpret_cast<DmacDescriptor*>(keep));
                 m_currentExecutingDesc[id] = reinterpret_cast<DmacDescriptor*>(&dmac_base[id]);
+                // restart() cleared the hardware flags and the channel is live again: the
+                // end-of-chain SUSP still in the `flags` snapshot must not idle it below.
+                flags &= static_cast<U8>(~DMAC_CHINTFLAG_SUSP);
             } else if (keep != nullptr) {
                 // Relink the anchor past the freed nodes so appendToChain never
                 // traverses a reclaimed slot; the boundary is the new oldest node.

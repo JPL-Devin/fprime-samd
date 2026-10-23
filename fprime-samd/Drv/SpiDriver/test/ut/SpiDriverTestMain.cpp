@@ -51,6 +51,16 @@ TEST(OffNominal, Busy) {
     tester.testBusy();
 }
 
+TEST(OffNominal, SameSlotReRequest) {
+    Samd21::SpiDriverTester tester;
+    tester.testSameSlotReRequest();
+}
+
+TEST(OffNominal, DmaBusError) {
+    Samd21::SpiDriverTester tester;
+    tester.testDmaBusError();
+}
+
 TEST(OffNominal, ConfigureTwice) {
     Samd21::SpiDriverTester tester;
     tester.testConfigureTwice();

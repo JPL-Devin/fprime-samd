@@ -59,14 +59,21 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     //! A second configure() asserts
     void testConfigureTwice();
 
-    //! A request before configure() asserts
+    //! A request before configure() is refused with SPI_CONFIG_ERR from activeIn
     void testRequestBeforeConfigure();
 
     //! Nominal full-duplex transaction on every port, both DMA completion orders
     void testTransaction();
 
-    //! A request while a transaction is in flight is rejected with SPI_OTHER_ERR
+    //! A request on another slot while a transaction is in flight is refused with SPI_BUSY_ERR from activeIn
     void testBusy();
+
+    //! A request on the slot in flight, or on a slot with an undelivered outcome, is answered
+    //! synchronously with SPI_BUSY_ERR and never asserts; the in-flight transfer completes normally
+    void testSameSlotReRequest();
+
+    //! A DMA BUS_ERROR on either stream aborts the other stream, releases the bus and replies SPI_OTHER_ERR
+    void testDmaBusError();
 
     //! Hardware chip select transactions never touch the GPIO ports
     void testHardwareChipSelectTransaction();
@@ -74,7 +81,7 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     //! Mismatched write/read sizes assert
     void testSizeMismatch();
 
-    //! A DMA reply with no transaction in flight asserts
+    //! A DMA reply with no transaction in flight, or a duplicate completion, is ignored
     void testUnexpectedDmaReply();
 
     //! calculateBaud: exact values, round-up, and bounds

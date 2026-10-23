@@ -113,13 +113,30 @@ void SpiDriver ::SpiWriteRead_handler(FwIndexType portNum, Fw::Buffer& writeBuff
     // Caller contract (not a hardware condition): both streams clock the same number of bytes
     FW_ASSERT(writeBuffer.getSize() == readBuffer.getSize(), writeBuffer.getSize(), readBuffer.getSize());
     FW_ASSERT(writeBuffer.getSize() <= 0xFFFF);  // DMA block transfer count is 16 bits
-    if (!this->m_configured) {
-        this->latchReply(portNum, writeBuffer, readBuffer, Drv::SpiStatus::SPI_CONFIG_ERR);
-        return;
-    }
+    FW_ASSERT(portNum >= 0 && portNum < NUM_SPIWRITEREAD_INPUT_PORTS, portNum);
     {
-        // m_busy is cleared by the ISR paths; decide and claim the bus atomically
+        // m_busy and the pending records are written by the ISR paths; decide and claim
+        // the bus atomically.
         Samd21::CriticalSection cs;
+        // A slot may carry one undelivered outcome. If this slot's transfer is in flight,
+        // or its last outcome still waits for activeIn, nothing may be latched for it: the
+        // ISR will write (or has written) the record. Answer the caller synchronously
+        // instead (Drv.AsyncGuardedSpi only requires that every request completes through
+        // SpiWriteReadComplete) -- never an assert, the trigger is a client re-request
+        // racing a completion, not a hardware condition.
+        const bool slotInFlight = (this->m_busy != 0) && (this->m_portNum == portNum);
+        if (slotInFlight || this->m_pending[portNum].pending) {
+            Samd21::CriticalSection::leave();
+            if (this->isConnected_SpiWriteReadComplete_OutputPort(portNum)) {
+                this->SpiWriteReadComplete_out(portNum, writeBuffer, readBuffer, Drv::SpiStatus::SPI_BUSY_ERR);
+            }
+            Samd21::CriticalSection::enter();
+            return;
+        }
+        if (!this->m_configured) {
+            this->latchReply(portNum, writeBuffer, readBuffer, Drv::SpiStatus::SPI_CONFIG_ERR);
+            return;
+        }
         if (this->m_busy != 0) {
             this->latchReply(portNum, writeBuffer, readBuffer, Drv::SpiStatus::SPI_BUSY_ERR);
             return;
@@ -182,11 +199,37 @@ void SpiDriver ::dmaReplyIn_handler(FwIndexType portNum, const Samd21::Dma::Repl
     if (this->m_busy == 0) {
         return;
     }
+    U8 doneBit;
+    SpiDriver_DmaChannel::T otherChannel;
+    U8 otherBit;
     if (portNum == SpiDriver_DmaChannel::MISO) {
-        this->m_busy &= static_cast<U8>(~BusyBit::RX_BUSY);
+        doneBit = BusyBit::RX_BUSY;
+        otherChannel = SpiDriver_DmaChannel::MOSI;
+        otherBit = BusyBit::TX_BUSY;
     } else if (portNum == SpiDriver_DmaChannel::MOSI) {
-        this->m_busy &= static_cast<U8>(~BusyBit::TX_BUSY);
+        doneBit = BusyBit::TX_BUSY;
+        otherChannel = SpiDriver_DmaChannel::MISO;
+        otherBit = BusyBit::RX_BUSY;
     } else {
+        return;
+    }
+    if ((this->m_busy & doneBit) == 0) {
+        // Duplicate completion of a channel already accounted for: ignore
+        return;
+    }
+    this->m_busy &= static_cast<U8>(~doneBit);
+    if (reply.get_status() != Samd21::Dma::Status::OK) {
+        // The stream faulted part-way (AHB bus error on a caller buffer): the bytes were
+        // not all moved, so the transfer cannot be reported SPI_OK, and the other stream
+        // would otherwise wait forever for its trigger. Stop it, release the bus and
+        // fail the request. The DMA driver raises no reply for an aborted channel.
+        if (this->m_busy & otherBit) {
+            this->dmaTransactionAbortOut_out(otherChannel);
+        }
+        this->m_busy = 0;
+        this->deassertChipSelect();
+        this->latchReply(this->m_portNum, this->m_write.getBuffer(), this->m_read.getBuffer(),
+                         Drv::SpiStatus::SPI_OTHER_ERR);
         return;
     }
     if (this->m_busy == 0) {
@@ -254,8 +297,8 @@ void SpiDriver ::latchReply(FwIndexType portNum,
                             Drv::SpiStatus::T status) {
     FW_ASSERT(portNum >= 0 && portNum < NUM_SPIWRITEREAD_INPUT_PORTS, portNum);
     PendingReply& slot = this->m_pending[portNum];
-    // A client owns one request at a time per slot: the previous completion must have been
-    // delivered before it asks again (software protocol, hence an assertion).
+    // Invariant kept by SpiWriteRead_handler (a slot with an undelivered outcome is refused
+    // synchronously), so this never fires on hardware or client traffic.
     FW_ASSERT(!slot.pending, portNum, static_cast<FwAssertArgType>(slot.status));
     slot.write = Samd21::ThinBuffer(writeBuffer);
     slot.read = Samd21::ThinBuffer(readBuffer);

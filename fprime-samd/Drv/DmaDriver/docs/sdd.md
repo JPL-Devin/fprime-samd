@@ -158,7 +158,7 @@ Each channel uses a descriptor-based transfer model:
 
 The descriptor pool is shared across all 12 channels. A 32-bit bitfield (`m_descriptors_used`) tracks which descriptors are in use. Descriptors are allocated when transactions are queued and freed when they complete (unless the channel is in circular mode).
 
-**Automatic Chain Linking:** Transactions can be queued while a channel is active. The driver suspends the channel momentarily, links the new descriptor to the end of the chain, and resumes automatically. If the channel completes before linking (race condition detected via SUSP flag), the new descriptor becomes the new base descriptor and the channel restarts.
+**Automatic Chain Linking:** Transactions can be queued while a channel is active. The driver suspends the channel momentarily, links the new descriptor to the end of the chain, and resumes automatically. If the channel completes before the link is seen, `handleInterrupt` reloads the unexecuted boundary node as the base descriptor and re-enables the channel (see §3.4.2).
 
 #### 3.5.1 Descriptor Lifecycle
 

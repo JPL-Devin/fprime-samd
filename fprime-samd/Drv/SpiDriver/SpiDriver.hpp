@@ -44,8 +44,8 @@ class SpiDriver final : public SpiDriverComponentBase {
 
     //! In combination with the Clock Polarity bit (CPOL), this bit determines the SPI transfer mode.
     enum class ClockPhase {
-        SampleOnLeadingSck = 0,  //!< The data is sampled on a leading SCK edge and changed on a trailing SCK edge.
-        SampleOnRisingSck = 1,   //!< The data is sampled on a trailing SCK edge and changed on a leading SCK edge.
+        SampleOnLeadingSck = 0,   //!< The data is sampled on a leading SCK edge and changed on a trailing SCK edge.
+        SampleOnTrailingSck = 1,  //!< The data is sampled on a trailing SCK edge and changed on a leading SCK edge.
     };
 
     //! These bits define the data in (DI/MISO) pad configurations.
@@ -69,7 +69,7 @@ class SpiDriver final : public SpiDriverComponentBase {
 
     //! This bit defines the functionality in standby sleep mode.
     enum class RunInStandby {
-        DISABLED,  //!< GCLK_SERCOMx_CORE is disabled and the I2C host will not operate in standby sleep mode.
+        DISABLED,  //!< GCLK_SERCOMx_CORE is disabled and the SPI host will not operate in standby sleep mode.
         ENABLED,   //!< GCLK_SERCOMx_CORE is enabled in all sleep modes.
     };
 
@@ -85,7 +85,6 @@ class SpiDriver final : public SpiDriverComponentBase {
         BITS_9 = 0x1,  //!< 9 bits
     };
 
-    //! Configure a SERCOM device for SPI Master (host) mode.
     //! Compute the BAUD register value for SPI host mode.
     //!
     //! In SPI host operation the baud-rate generator runs in Synchronous mode with
@@ -103,6 +102,9 @@ class SpiDriver final : public SpiDriverComponentBase {
     //! fast afterwards). Asserts when not configured or while a transfer is in flight.
     void setBaudRate(U32 baud_rate_khz);
 
+    //! Configure a SERCOM device for SPI Master (host) mode. Registers the SERCOM ERROR
+    //! interrupt, deasserts every connected software chip select and marks the driver
+    //! configured. Asserts if called twice.
     void configure(SercomKind sercom,
                    U32 baud_rate_khz,
                    DataOrder data_order,
@@ -119,8 +121,10 @@ class SpiDriver final : public SpiDriverComponentBase {
     // ----------------------------------------------------------------------
 
     //! Handler implementation for SpiWriteRead (Drv.AsyncGuardedSpi). Starts the transfer
-    //! or latches a refusal (SPI_BUSY_ERR, SPI_CONFIG_ERR); the outcome always arrives on
-    //! SpiWriteReadComplete from activeIn.
+    //! or refuses it (SPI_BUSY_ERR, SPI_CONFIG_ERR). A refusal is latched for activeIn unless
+    //! the slot already holds an undelivered outcome (its transfer is in flight or its last
+    //! completion has not been delivered yet); then SPI_BUSY_ERR is answered synchronously
+    //! from inside this call, so a slot never carries two outcomes and no ISR path asserts.
     void SpiWriteRead_handler(FwIndexType portNum,  //!< The port number
                               Fw::Buffer& writeBuffer,
                               Fw::Buffer& readBuffer) override;
@@ -134,8 +138,9 @@ class SpiDriver final : public SpiDriverComponentBase {
     //! Handler implementation for dmaReplyIn
     //!
     //! A signal from the DMAC that a request has finished. This signal comes inside an
-    //! ISR: it only releases the chip select and latches the reply. A reply that matches
-    //! no transfer in flight is ignored.
+    //! ISR: it only releases the chip select and latches the reply. A BUS_ERROR on either
+    //! stream aborts the other stream, releases the bus and latches SPI_OTHER_ERR. A reply
+    //! that matches no transfer in flight is ignored.
     void dmaReplyIn_handler(FwIndexType portNum,  //!< The port number
                             const Samd21::Dma::Reply& reply) override;
 
@@ -154,9 +159,9 @@ class SpiDriver final : public SpiDriverComponentBase {
     //! Release the chip select of the transfer in flight (software chip select only)
     void deassertChipSelect();
 
-    //! Latch a reply for `portNum` to be delivered by the next activeIn. Asserts when that
-    //! slot already holds an undelivered reply (a client must wait for its completion
-    //! before issuing the next request on the same slot).
+    //! Latch a reply for `portNum` to be delivered by the next activeIn. The slot is free
+    //! by construction (SpiWriteRead_handler refuses synchronously otherwise); the assert
+    //! guards that invariant, not a hardware condition.
     void latchReply(FwIndexType portNum,
                     const Fw::Buffer& writeBuffer,
                     const Fw::Buffer& readBuffer,
@@ -185,8 +190,9 @@ class SpiDriver final : public SpiDriverComponentBase {
     bool m_hardware_chip_select;
 
     //! One completion waiting for activeIn, per slot. Written by the ISR paths (transfer
-    //! done, receive overrun) and by refused requests; read and cleared by activeIn under a
-    //! critical section.
+    //! done, DMA bus error, receive overrun) and by refused requests; read and cleared by
+    //! activeIn under a critical section. Invariant: a slot holds at most one undelivered
+    //! outcome, counting the transfer in flight.
     struct PendingReply {
         Samd21::ThinBuffer write;
         Samd21::ThinBuffer read;

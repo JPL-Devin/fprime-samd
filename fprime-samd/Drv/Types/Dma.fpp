@@ -133,9 +133,10 @@ module Samd21 {
       remainingBytes: U32 @< Bytes NOT transferred (0 if OK, >0 if BUS_ERROR)
     }
 
-    @ Reply port for DMA transaction completion. Invoked from the DMAC ISR while the
-    @ channel's bookkeeping is still in progress: the handler must NOT queue a new
-    @ transaction on the same channel from inside this call -- defer it to main context.
+    @ Reply port for DMA transaction completion. Invoked from the DMAC ISR after the
+    @ channel's bookkeeping has settled and its flags are cleared: the handler may queue
+    @ a new transaction (on this channel or any other) from inside this call. ISR
+    @ context: return promptly, no blocking.
     port TransactionReply(reply: Dma.Reply)
 
     @ Used for accessing the writeback descriptor for peaking into DMA for Rx

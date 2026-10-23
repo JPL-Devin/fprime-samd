@@ -144,7 +144,7 @@ void SpiHal::configure(SercomKind sercom,
         case SpiDriver::ClockPhase::SampleOnLeadingSck:
             ctrla.bit.CPHA = 0;
             break;
-        case SpiDriver::ClockPhase::SampleOnRisingSck:
+        case SpiDriver::ClockPhase::SampleOnTrailingSck:
             ctrla.bit.CPHA = 1;
             break;
         default:
