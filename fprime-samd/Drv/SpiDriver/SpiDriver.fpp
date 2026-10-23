@@ -17,13 +17,15 @@ module Samd21 {
         @ before configure()). Completions are delivered from activeIn, never from an ISR and
         @ never from inside the request call. A slot may have at most two requests outstanding
         @ (one transfer or completion plus one refusal) between activeIn turns; a third asserts.
-        @ The guarded flavour of the interface (rather than Drv.AsyncSpi) puts an Os::Mutex
-        @ around the request handler. On this single-context baremetal target every caller is
-        @ already serialised by Svc.PassiveCycler, so the mutex never contends; a request from
-        @ a second context (an ISR, or another task on an RTOS build) would be detected by it
-        @ -- Os::Mutex::lock asserts on ERROR_BUSY -- rather than serialised. The state shared
-        @ with the DMAC/SERCOM interrupts is protected by Samd21::CriticalSection inside the
-        @ handlers, not by the guard.
+        @ The guarded flavour of the interface is used because this is a passive component:
+        @ it cannot take Drv.AsyncSpi's async request port. The guard is an Os::Mutex around
+        @ the request handler and protects against a second task only (an RTOS build with two
+        @ callers). Requests must never be issued from an ISR: on this target Os::Mutex::take
+        @ does not block and lock() asserts on ERROR_BUSY, so an ISR request landing while
+        @ main context is inside the handler asserts, it is not serialised. On the
+        @ single-context baremetal target every caller is already serialised by
+        @ Svc.PassiveCycler and the mutex never contends; the state shared with the
+        @ DMAC/SERCOM interrupts is protected by Samd21::CriticalSection inside the handlers.
         import Drv.AsyncGuardedSpi
 
         @ REQUIRED CONNECTION. Main-context delivery of the completions latched by the DMAC
