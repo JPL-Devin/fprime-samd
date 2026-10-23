@@ -150,9 +150,10 @@ class SpiDriver final : public SpiDriverComponentBase {
     //! Handler implementation for dmaReplyIn
     //!
     //! A signal from the DMAC that a request has finished. This signal comes inside an
-    //! ISR: it only releases the chip select and latches the reply. A BUS_ERROR on either
-    //! stream aborts the other stream, releases the bus and latches SPI_OTHER_ERR. A reply
-    //! that matches no transfer in flight is ignored.
+    //! ISR: it releases the chip select and latches the reply, nothing is delivered. A
+    //! BUS_ERROR on either stream aborts the other stream, drains and acknowledges the
+    //! SERCOM receiver, releases the bus and latches SPI_OTHER_ERR. A reply that matches no
+    //! transfer in flight is ignored.
     void dmaReplyIn_handler(FwIndexType portNum,  //!< The port number
                             const Samd21::Dma::Reply& reply) override;
 

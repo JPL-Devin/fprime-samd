@@ -62,8 +62,8 @@ selects on `FPRIME_PLATFORM`.
 
 `Drv.AsyncSpiCfg.SpiDriverPorts` (F Prime default 10) should be overridden in the project
 configuration to the number of chip selects wired: each slot costs two pending-reply records
-(outcome and refusal; plus two port objects in builds without `FW_DIRECT_PORT_CALLS`;
-`fprime-samd-reference` uses 4).
+(outcome and refusal; plus three port objects -- request, completion, chip select -- in builds
+without `FW_DIRECT_PORT_CALLS`; `fprime-samd-reference` uses 4).
 
 ### 3.2 Configuration (`configure()`, `setBaudRate()`)
 
