@@ -28,7 +28,8 @@ static const U32 TEST_BAUD_KHZ = 4000;
 SpiDriverTester ::SpiDriverTester()
     : SpiDriverGTestBase("SpiDriverTester", SpiDriverTester::MAX_HISTORY_SIZE),
       component("SpiDriver"),
-      m_hardwareChipSelect(false) {
+      m_hardwareChipSelect(false),
+      m_chipSelectStatus(Drv::GpioStatus::OP_OK) {
     this->initComponents();
     this->connectPorts();
     SpiHardware::resetStubState();
@@ -218,6 +219,28 @@ void SpiDriverTester ::testSameSlotReRequest() {
     // And the slot is usable again
     this->startTransaction(0, 3);
     this->finishTransaction(0, false);
+}
+
+void SpiDriverTester ::testChipSelectFailure() {
+    // REQUIREMENT(SPI-XFER-006, SPI-CFG-007): a chip select the GPIO driver cannot drive fails the request with
+    //                          SPI_OTHER_ERR from activeIn and clocks nothing; configure() asserts on it
+    this->configure(SpiDriver::HardwareChipSelect::DISABLED);
+    this->m_chipSelectStatus = Drv::GpioStatus::NOT_OPENED;
+    this->clearAll();
+    this->invoke_to_SpiWriteRead(1, this->m_writeBuffer[1], this->m_readBuffer[1]);
+    ASSERT_from_chipSelectGpioOut_SIZE(1);
+    this->assertChipSelect(0, 1, Fw::Logic::LOW);
+    ASSERT_from_dmaTransactionOut_SIZE(0);
+    this->assertReply(1, Drv::SpiStatus::SPI_OTHER_ERR);
+    this->clearAll();
+    // The bus was released: a request with a working chip select proceeds normally
+    this->m_chipSelectStatus = Drv::GpioStatus::OP_OK;
+    this->startTransaction(1, 4);
+    this->finishTransaction(1, true);
+    // configure() with an undriveable chip select is an integration error and asserts
+    SpiDriverTester other;
+    other.m_chipSelectStatus = Drv::GpioStatus::INVALID_MODE;
+    ASSERT_DEATH_IF_SUPPORTED(other.configure(SpiDriver::HardwareChipSelect::DISABLED), "");
 }
 
 void SpiDriverTester ::testDmaBusError() {
@@ -504,7 +527,7 @@ Drv::GpioStatus SpiDriverTester ::from_chipSelectGpioOut_handler(FwIndexType por
     if (index < MAX_HISTORY_SIZE) {
         this->m_chipSelectPorts[index] = portNum;
     }
-    return Drv::GpioStatus::OP_OK;
+    return this->m_chipSelectStatus;
 }
 
 void SpiDriverTester ::from_dmaTransactionOut_handler(FwIndexType portNum,

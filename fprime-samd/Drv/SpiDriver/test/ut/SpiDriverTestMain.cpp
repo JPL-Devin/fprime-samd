@@ -56,6 +56,11 @@ TEST(OffNominal, SameSlotReRequest) {
     tester.testSameSlotReRequest();
 }
 
+TEST(OffNominal, ChipSelectFailure) {
+    Samd21::SpiDriverTester tester;
+    tester.testChipSelectFailure();
+}
+
 TEST(OffNominal, DmaBusError) {
     Samd21::SpiDriverTester tester;
     tester.testDmaBusError();

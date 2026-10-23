@@ -31,6 +31,7 @@ selects on `FPRIME_PLATFORM`.
 | SPI-CFG-004 | Reconfiguring an already configured driver shall assert. | Unit Test |
 | SPI-CFG-005 | The BAUD register shall be computed as `fref / (2 * fsck) - 1`, rounded so the real SCK never exceeds the requested rate. | Unit Test |
 | SPI-CFG-006 | `calculateBaud` shall assert on a zero rate, a rate above `fref / 2`, or a rate too slow for the 8-bit register, before any arithmetic that could overflow. | Unit Test |
+| SPI-CFG-007 | With software chip select, `configure()` shall assert if a connected chip-select GPIO cannot be driven (`GpioStatus` other than `OP_OK`): the pin was not opened as an output before the driver was configured, an integration error. | Unit Test |
 | SPI-REQ-001 | A request issued before `configure()` shall be refused with `SPI_CONFIG_ERR`, delivered from `activeIn`, and generate no DMA or chip-select traffic. | Unit Test |
 | SPI-REQ-002 | A request whose write and read buffers differ in size shall assert (full duplex). | Unit Test |
 | SPI-XFER-001 | A request shall assert the port's chip select (software mode) and queue the MISO then the MOSI DMA transaction against the SERCOM DATA register. | Unit Test, Hardware Test |
@@ -38,6 +39,7 @@ selects on `FPRIME_PLATFORM`.
 | SPI-XFER-003 | One transaction at a time: an overlapping request on another slot shall be refused with `SPI_BUSY_ERR`, delivered from `activeIn`, and generate no DMA or chip-select traffic. A request on a slot that already holds an undelivered outcome (its transfer in flight, or its last completion not yet delivered) shall be refused with `SPI_BUSY_ERR` from `activeIn`, delivered before that outcome, without asserting; a third request on the same slot before `activeIn` runs is a client protocol error and asserts in the caller's context. | Unit Test |
 | SPI-XFER-004 | With hardware chip select the transaction shall not drive the GPIO ports. | Unit Test |
 | SPI-XFER-005 | A DMA completion with nothing in flight, a duplicate completion of one channel, or a completion on an unknown channel shall be ignored. | Unit Test |
+| SPI-XFER-006 | If the GPIO driver refuses to assert the software chip select of a request, the driver shall not start the DMA streams, shall release the bus and shall refuse the request with `SPI_OTHER_ERR` from `activeIn`. | Unit Test |
 | SPI-ERR-001 | `configure()` shall register for the SERCOM interrupt and enable only its `ERROR` source (receive buffer overflow, `STATUS.BUFOVF`), at the same NVIC priority as the DMAC interrupt. | Unit Test, Hardware Test |
 | SPI-ERR-002 | On a receive overrun during a transaction the driver shall abort every DMA stream still outstanding via `dmaTransactionAbortOut`, acknowledge the hardware (wait for the shifter to go idle, clear `BUFOVF`, drain `DATA`, clear `INTFLAG.ERROR`), deassert the chip select (software mode) and reply on the requesting port with `SPI_OTHER_ERR` and the caller's buffers. | Unit Test, Hardware Test |
 | SPI-ERR-003 | After an overrun reply the driver shall accept a new transaction immediately. | Unit Test, Hardware Test |
@@ -147,14 +149,15 @@ The CY15B102QN F-RAM driver (separate PR) is the reference consumer.
 
 ## 5. Unit tests
 
-`test/ut/` runs natively against the stub HAL (19 tests): configuration in both chip-select
+`test/ut/` runs natively against the stub HAL (20 tests): configuration in both chip-select
 modes, reconfigure assert, request before configure (`SPI_CONFIG_ERR` via `activeIn`), nominal
 transactions in both DMA completion orders on every slot, busy refusal on another slot
 (`SPI_BUSY_ERR`, delivered by `activeIn`), re-request on the in-flight slot and on a slot with
 an undelivered completion (`SPI_BUSY_ERR` latched and delivered ahead of the outcome, third
 request asserts), DMA `BUS_ERROR` on either stream and on the second completion (other stream
 aborted, chip select released, `SPI_OTHER_ERR`, bus reusable), hardware chip
-select, size mismatch, stray/duplicate/late DMA replies ignored, `activeIn` with nothing
+select, chip select refused by the GPIO driver (`SPI_OTHER_ERR`, no DMA traffic; assert in
+`configure()`), size mismatch, stray/duplicate/late DMA replies ignored, `activeIn` with nothing
 pending, `setBaudRate` (idle, before configure, while busy), BAUD boundaries and overflow,
 500 randomized transactions, and the receive-overrun path (both streams outstanding, one
 stream outstanding, spurious interrupt, overrun while idle, recovery on every slot and in

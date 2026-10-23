@@ -90,7 +90,10 @@ void SpiDriver ::configure(SercomKind sercom,
     if (!this->m_hardware_chip_select) {
         for (FwIndexType i = 0; i < this->getNum_chipSelectGpioOut_OutputPorts(); i++) {
             if (this->isConnected_chipSelectGpioOut_OutputPort(i)) {
-                this->chipSelectGpioOut_out(i, Fw::Logic::HIGH);
+                // Init-time check of the integration: the chip-select pin must already be an
+                // opened output (GpioDriver configured before this component).
+                const Drv::GpioStatus status = this->chipSelectGpioOut_out(i, Fw::Logic::HIGH);
+                FW_ASSERT(status == Drv::GpioStatus::OP_OK, static_cast<FwAssertArgType>(status.e), i);
             }
         }
     }
@@ -154,7 +157,15 @@ void SpiDriver ::SpiWriteRead_handler(FwIndexType portNum, Fw::Buffer& writeBuff
 
     if (!this->m_hardware_chip_select) {
         if (this->isConnected_chipSelectGpioOut_OutputPort(this->m_portNum)) {
-            this->chipSelectGpioOut_out(this->m_portNum, Fw::Logic::LOW);
+            const Drv::GpioStatus status = this->chipSelectGpioOut_out(this->m_portNum, Fw::Logic::LOW);
+            if (status != Drv::GpioStatus::OP_OK) {
+                // No device selected: do not clock the bus, fail the request instead of
+                // reporting SPI_OK for a transfer that reached nothing.
+                Samd21::CriticalSection cs;
+                this->m_busy = 0;
+                this->latchReply(portNum, writeBuffer, readBuffer, Drv::SpiStatus::SPI_OTHER_ERR);
+                return;
+            }
         }
     }
 
@@ -300,7 +311,10 @@ void SpiDriver ::isrHandler() {
 void SpiDriver ::deassertChipSelect() {
     if (!this->m_hardware_chip_select) {
         if (this->isConnected_chipSelectGpioOut_OutputPort(this->m_portNum)) {
-            this->chipSelectGpioOut_out(this->m_portNum, Fw::Logic::HIGH);
+            // Release is best effort and may run in ISR context: the pin was proven an
+            // opened output by configure() and by the assert that started this transfer,
+            // so the status cannot differ from OP_OK here, and an ISR must not assert.
+            (void)this->chipSelectGpioOut_out(this->m_portNum, Fw::Logic::HIGH);
         }
     }
 }
@@ -311,8 +325,8 @@ void SpiDriver ::latchReply(FwIndexType portNum,
                             Drv::SpiStatus::T status) {
     FW_ASSERT(portNum >= 0 && portNum < NUM_SPIWRITEREAD_INPUT_PORTS, portNum);
     PendingReply& slot = this->m_pending[portNum];
-    // Invariant kept by SpiWriteRead_handler (a slot with an undelivered outcome is refused
-    // synchronously), so this never fires on hardware or client traffic.
+    // Invariant kept by SpiWriteRead_handler (a request on a slot with an undelivered
+    // outcome goes to the refusal record instead), so this never fires on hardware traffic.
     FW_ASSERT(!slot.pending, portNum, static_cast<FwAssertArgType>(slot.status));
     slot.write = Samd21::ThinBuffer(writeBuffer);
     slot.read = Samd21::ThinBuffer(readBuffer);

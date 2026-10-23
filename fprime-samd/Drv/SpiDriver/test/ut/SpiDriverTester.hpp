@@ -74,6 +74,10 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     void testSameSlotReRequest();
 
     //! A DMA BUS_ERROR on either stream aborts the other stream, releases the bus and replies SPI_OTHER_ERR
+    //! A chip select the GPIO driver refuses fails the request with SPI_OTHER_ERR (no DMA traffic);
+    //! configure() asserts on it
+    void testChipSelectFailure();
+
     void testDmaBusError();
 
     //! Hardware chip select transactions never touch the GPIO ports
@@ -178,6 +182,8 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     //! Port indices seen on the from ports, parallel to the generated histories
     FwIndexType m_replyPorts[MAX_HISTORY_SIZE];
     FwIndexType m_chipSelectPorts[MAX_HISTORY_SIZE];
+    //! Status the stub GPIO driver returns for every chip-select write (default OP_OK)
+    Drv::GpioStatus m_chipSelectStatus;
     FwIndexType m_dmaPorts[MAX_HISTORY_SIZE];
     FwIndexType m_abortPorts[MAX_HISTORY_SIZE];
 
