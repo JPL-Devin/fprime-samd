@@ -159,10 +159,8 @@ void SpiDriverTester ::testBusy() {
     // activeIn delivers both refusals on slot 1
     this->invoke_to_activeIn(0, 0);
     ASSERT_from_SpiWriteReadComplete_SIZE(2);
-    ASSERT_EQ(this->m_replyPorts[0], 1);
-    ASSERT_EQ(this->m_replyPorts[1], 1);
-    ASSERT_EQ(this->fromPortHistory_SpiWriteReadComplete->at(0).status.e, Drv::SpiStatus::SPI_BUSY_ERR);
-    ASSERT_EQ(this->fromPortHistory_SpiWriteReadComplete->at(1).status.e, Drv::SpiStatus::SPI_BUSY_ERR);
+    this->assertDelivered(0, 1, Drv::SpiStatus::SPI_BUSY_ERR);
+    this->assertDelivered(1, 1, Drv::SpiStatus::SPI_BUSY_ERR);
     this->clearAll();
 
     // The original transfer completes normally afterwards
@@ -194,10 +192,8 @@ void SpiDriverTester ::testSameSlotReRequest() {
     // activeIn delivers the refusal first, then the completion
     this->invoke_to_activeIn(0, 0);
     ASSERT_from_SpiWriteReadComplete_SIZE(2);
-    ASSERT_EQ(this->m_replyPorts[0], 0);
-    ASSERT_EQ(this->m_replyPorts[1], 0);
-    ASSERT_EQ(this->fromPortHistory_SpiWriteReadComplete->at(0).status.e, Drv::SpiStatus::SPI_BUSY_ERR);
-    ASSERT_EQ(this->fromPortHistory_SpiWriteReadComplete->at(1).status.e, Drv::SpiStatus::SPI_OK);
+    this->assertDelivered(0, 0, Drv::SpiStatus::SPI_BUSY_ERR);
+    this->assertDelivered(1, 0, Drv::SpiStatus::SPI_OK);
     this->clearAll();
     // A request on a slot whose completion is latched but undelivered is refused the same way
     this->startTransaction(0, 4);
@@ -213,8 +209,8 @@ void SpiDriverTester ::testSameSlotReRequest() {
     ASSERT_from_SpiWriteReadComplete_SIZE(0);
     this->invoke_to_activeIn(0, 0);
     ASSERT_from_SpiWriteReadComplete_SIZE(2);
-    ASSERT_EQ(this->fromPortHistory_SpiWriteReadComplete->at(0).status.e, Drv::SpiStatus::SPI_BUSY_ERR);
-    ASSERT_EQ(this->fromPortHistory_SpiWriteReadComplete->at(1).status.e, Drv::SpiStatus::SPI_OK);
+    this->assertDelivered(0, 0, Drv::SpiStatus::SPI_BUSY_ERR);
+    this->assertDelivered(1, 0, Drv::SpiStatus::SPI_OK);
     this->clearAll();
     // And the slot is usable again
     this->startTransaction(0, 3);
@@ -631,6 +627,16 @@ void SpiDriverTester ::finishTransaction(FwIndexType port, bool misoFirst) {
 void SpiDriverTester ::assertChipSelect(FwSizeType index, FwIndexType port, Fw::Logic::T state) {
     ASSERT_EQ(this->m_chipSelectPorts[index], port);
     ASSERT_from_chipSelectGpioOut(index, Fw::Logic(state));
+}
+
+void SpiDriverTester ::assertDelivered(FwSizeType index, FwIndexType port, Drv::SpiStatus::T status) {
+    ASSERT_EQ(this->m_replyPorts[index], port);
+    const FromPortEntry_SpiWriteReadComplete& entry = this->fromPortHistory_SpiWriteReadComplete->at(index);
+    ASSERT_EQ(entry.status.e, status);
+    ASSERT_EQ(entry.writeBuffer.getData(), this->m_writeBuffer[port].getData());
+    ASSERT_EQ(entry.writeBuffer.getSize(), this->m_writeBuffer[port].getSize());
+    ASSERT_EQ(entry.readBuffer.getData(), this->m_readBuffer[port].getData());
+    ASSERT_EQ(entry.readBuffer.getSize(), this->m_readBuffer[port].getSize());
 }
 
 void SpiDriverTester ::assertReply(FwIndexType port, Drv::SpiStatus::T status) {

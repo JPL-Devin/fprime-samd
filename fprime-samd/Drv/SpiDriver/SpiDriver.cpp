@@ -188,7 +188,8 @@ void SpiDriver ::SpiWriteRead_handler(FwIndexType portNum, Fw::Buffer& writeBuff
 
 bool SpiDriver ::activeIn_handler(FwIndexType portNum, U32 context) {
     for (FwIndexType slot = 0; slot < NUM_SPIWRITEREAD_INPUT_PORTS; slot++) {
-        // The refusal (if any) is older than the outcome it collided with: deliver it first.
+        // Deliver the refusal (if any) first: it carries no data and tells the client its
+        // re-request was dropped before the older request's outcome lets it re-arm.
         this->deliver(this->m_refused[slot], slot);
         this->deliver(this->m_pending[slot], slot);
     }
@@ -196,7 +197,7 @@ bool SpiDriver ::activeIn_handler(FwIndexType portNum, U32 context) {
 }
 
 void SpiDriver ::deliver(PendingReply& record, FwIndexType slot) {
-    PendingReply reply;
+    PendingReply reply = {};
     {
         // The ISR paths write the record; copy and clear it with interrupts masked, then
         // call the client with them enabled (the callback may start the next transfer).
@@ -312,8 +313,8 @@ void SpiDriver ::deassertChipSelect() {
     if (!this->m_hardware_chip_select) {
         if (this->isConnected_chipSelectGpioOut_OutputPort(this->m_portNum)) {
             // Release is best effort and may run in ISR context: the pin was proven an
-            // opened output by configure() and by the assert that started this transfer,
-            // so the status cannot differ from OP_OK here, and an ISR must not assert.
+            // opened output by configure() and by the status check that started this
+            // transfer, so the status cannot differ from OP_OK here, and an ISR must not assert.
             (void)this->chipSelectGpioOut_out(this->m_portNum, Fw::Logic::HIGH);
         }
     }

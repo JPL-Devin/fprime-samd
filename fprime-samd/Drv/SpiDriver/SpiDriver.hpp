@@ -104,7 +104,8 @@ class SpiDriver final : public SpiDriverComponentBase {
 
     //! Configure a SERCOM device for SPI Master (host) mode. Registers the SERCOM ERROR
     //! interrupt, deasserts every connected software chip select and marks the driver
-    //! configured. Asserts if called twice.
+    //! configured. Asserts if called twice, or if a connected chip-select GPIO cannot be
+    //! driven (not opened as an output before this call).
     void configure(SercomKind sercom,
                    U32 baud_rate_khz,
                    DataOrder data_order,
@@ -129,8 +130,9 @@ class SpiDriver final : public SpiDriverComponentBase {
     // ----------------------------------------------------------------------
 
     //! Handler implementation for SpiWriteRead (Drv.AsyncGuardedSpi). Starts the transfer
-    //! or refuses it (SPI_BUSY_ERR, SPI_CONFIG_ERR); every outcome is latched and delivered
-    //! by activeIn, never from inside this call. A request on a slot whose transfer is in
+    //! or refuses it (SPI_BUSY_ERR, SPI_CONFIG_ERR, SPI_OTHER_ERR when the software chip
+    //! select cannot be asserted); every outcome is latched and delivered by activeIn,
+    //! never from inside this call. A request on a slot whose transfer is in
     //! flight, or whose last outcome activeIn has not delivered yet, is latched in the slot's
     //! refusal record (SPI_BUSY_ERR) so it cannot collide with the ISR's outcome record. A
     //! third request on that slot before activeIn runs is a client protocol error and asserts
@@ -173,9 +175,10 @@ class SpiDriver final : public SpiDriverComponentBase {
     //! SpiWriteReadComplete[slot] with interrupts enabled.
     void deliver(PendingReply& record, FwIndexType slot);
 
-    //! Latch a reply for `portNum` to be delivered by the next activeIn. The slot is free
-    //! by construction (SpiWriteRead_handler refuses synchronously otherwise); the assert
-    //! guards that invariant, not a hardware condition.
+    //! Latch an outcome for `portNum` to be delivered by the next activeIn. The slot's
+    //! outcome record is free by construction (SpiWriteRead_handler sends a request on an
+    //! occupied slot to the refusal record instead); the assert guards that invariant, not
+    //! a hardware condition.
     void latchReply(FwIndexType portNum,
                     const Fw::Buffer& writeBuffer,
                     const Fw::Buffer& readBuffer,

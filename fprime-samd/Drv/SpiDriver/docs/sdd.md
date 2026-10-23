@@ -56,8 +56,8 @@ selects on `FPRIME_PLATFORM`.
 | output | `SpiWriteReadComplete[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.SpiWriteReadCallback` | **main context**, from `activeIn`; exactly one per request |
 | sync input | `activeIn` | `Svc.ActiveSched` | **required**: delivers latched completions and refusals; returns false |
 | output | `dmaTransactionOut[DmaChannel.N]` | `Dma.Transaction` | `MOSI`, `MISO` |
-| output | `dmaTransactionAbortOut[DmaChannel.N]` | `Fw.Signal` | abort a stream after a receive overrun; **ISR context** |
-| sync input | `dmaReplyIn[DmaChannel.N]` | `Dma.TransactionReply` | **ISR context**: latches only; `BUS_ERROR` aborts the other stream |
+| output | `dmaTransactionAbortOut[DmaChannel.N]` | `Fw.Signal` | abort a stream after a receive overrun or a DMA bus error; **ISR context** |
+| sync input | `dmaReplyIn[DmaChannel.N]` | `Dma.TransactionReply` | **ISR context**: latches the outcome; on `BUS_ERROR` aborts the other stream, acknowledges the SERCOM and releases the chip select (§3.4) |
 | output | `chipSelectGpioOut[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.GpioWrite` | software chip select only |
 
 `Drv.AsyncSpiCfg.SpiDriverPorts` (F Prime default 10) should be overridden in the project
@@ -79,14 +79,18 @@ called before `configure()` or with a transfer in flight.
 ### 3.3 Transaction behaviour
 
 ```
-SpiWriteRead[p] ─▶ unconfigured? ─▶ latch (p, SPI_CONFIG_ERR)
-                   busy?         ─▶ latch (p, SPI_BUSY_ERR)        no DMA, no chip select
+SpiWriteRead[p] ─▶ unconfigured?          ─▶ latch (p, SPI_CONFIG_ERR)
+                   slot p busy/undelivered? ─▶ refusal (p, SPI_BUSY_ERR)   no DMA, no chip select
+                   bus busy (other slot)?   ─▶ latch (p, SPI_BUSY_ERR)     no DMA, no chip select
+                   CS[p] LOW refused (sw)?  ─▶ bus released, latch (p, SPI_OTHER_ERR)   no DMA
                    else: CS[p] LOW (sw) → DMA MISO (DATA → read) → DMA MOSI (write → DATA)
    (ISR) dmaReplyIn[MISO], dmaReplyIn[MOSI] in either order; both done → CS[p] HIGH → latch (p, SPI_OK)
-   (ISR) dmaReplyIn[*] BUS_ERROR → abort the other stream → CS[p] HIGH → latch (p, SPI_OTHER_ERR)
-   (ISR) SERCOM ERROR/BUFOVF → abort outstanding stream(s) → CS[p] HIGH → latch (p, SPI_OTHER_ERR)
-activeIn ─▶ for every slot with a latched reply (copied and cleared under CriticalSection):
-           SpiWriteReadComplete[p](write, read, status)            main context
+   (ISR) dmaReplyIn[*] BUS_ERROR → abort the other stream → drain/ack SERCOM → CS[p] HIGH
+                                 → latch (p, SPI_OTHER_ERR)
+   (ISR) SERCOM ERROR/BUFOVF → abort outstanding stream(s) → drain/ack SERCOM → CS[p] HIGH
+                             → latch (p, SPI_OTHER_ERR)
+activeIn ─▶ for every slot, refusal then latched outcome (each copied and cleared under
+           CriticalSection): SpiWriteReadComplete[p](write, read, status)   main context
 ```
 
 Nothing is delivered from an ISR: the ISR paths and the refusals only write the slot's

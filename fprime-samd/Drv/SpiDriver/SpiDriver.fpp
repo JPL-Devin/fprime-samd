@@ -11,11 +11,18 @@ module Samd21 {
 
         @ Asynchronous SPI contract: SpiWriteRead[slot] starts one full-duplex transfer; every
         @ request is answered with exactly one SpiWriteReadComplete[slot] (SPI_OK; SPI_OTHER_ERR
-        @ on a receive overrun or a DMA bus error; SPI_BUSY_ERR while a transfer is in flight on
+        @ on a receive overrun, a DMA bus error or a software chip select the GPIO driver refuses
+        @ to drive; SPI_BUSY_ERR while a transfer is in flight on
         @ any slot, or while this slot's previous completion is still undelivered; SPI_CONFIG_ERR
         @ before configure()). Completions are delivered from activeIn, never from an ISR and
         @ never from inside the request call. A slot may have at most two requests outstanding
         @ (one transfer or completion plus one refusal) between activeIn turns; a third asserts.
+        @ The guarded flavour of the interface is used (rather than Drv.AsyncSpi) so that a
+        @ deployment with a second execution context (a task on an RTOS build, or a request
+        @ issued from an ISR) cannot interleave two request handlers; on the single-context
+        @ baremetal target every caller is already serialised by Svc.PassiveCycler and the
+        @ guard is inert -- the state shared with the DMAC/SERCOM interrupts is protected by
+        @ Samd21::CriticalSection inside the handlers, not by the guard.
         import Drv.AsyncGuardedSpi
 
         @ REQUIRED CONNECTION. Main-context delivery of the completions latched by the DMAC

@@ -73,11 +73,12 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     //! asserting; a third request on that slot asserts; the in-flight transfer completes normally
     void testSameSlotReRequest();
 
-    //! A DMA BUS_ERROR on either stream aborts the other stream, releases the bus and replies SPI_OTHER_ERR
     //! A chip select the GPIO driver refuses fails the request with SPI_OTHER_ERR (no DMA traffic);
     //! configure() asserts on it
     void testChipSelectFailure();
 
+    //! A DMA BUS_ERROR on either stream aborts the other stream, drains the receiver, releases the
+    //! bus and replies SPI_OTHER_ERR
     void testDmaBusError();
 
     //! Hardware chip select transactions never touch the GPIO ports
@@ -157,6 +158,9 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     //! Assert the n-th chip select call was (port, state)
     void assertChipSelect(FwSizeType index, FwIndexType port, Fw::Logic::T state);
 
+    //! Assert entry `index` of the completion history: port, status and the caller's buffers
+    void assertDelivered(FwSizeType index, FwIndexType port, Drv::SpiStatus::T status);
+
     //! Assert exactly one reply was emitted on port with the request buffers and status
     void assertReply(FwIndexType port, Drv::SpiStatus::T status);
     void injectOverrun();
@@ -182,13 +186,14 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     //! Port indices seen on the from ports, parallel to the generated histories
     FwIndexType m_replyPorts[MAX_HISTORY_SIZE];
     FwIndexType m_chipSelectPorts[MAX_HISTORY_SIZE];
-    //! Status the stub GPIO driver returns for every chip-select write (default OP_OK)
-    Drv::GpioStatus m_chipSelectStatus;
     FwIndexType m_dmaPorts[MAX_HISTORY_SIZE];
     FwIndexType m_abortPorts[MAX_HISTORY_SIZE];
 
     //! Whether the component was configured with hardware chip select
     bool m_hardwareChipSelect;
+
+    //! Status the stub GPIO driver returns for every chip-select write (default OP_OK)
+    Drv::GpioStatus m_chipSelectStatus;
 };
 
 }  // namespace Samd21
