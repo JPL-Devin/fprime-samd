@@ -10,10 +10,12 @@ module Samd21 {
         }
 
         @ Asynchronous SPI contract: SpiWriteRead[slot] starts one full-duplex transfer; every
-        @ request is answered with exactly one SpiWriteReadComplete[slot] (SPI_OK, SPI_OTHER_ERR
-        @ on a receive overrun, SPI_BUSY_ERR while another transfer is in flight, SPI_CONFIG_ERR
+        @ request is answered with exactly one SpiWriteReadComplete[slot] (SPI_OK; SPI_OTHER_ERR
+        @ on a receive overrun or a DMA bus error; SPI_BUSY_ERR while a transfer is in flight on
+        @ any slot, or while this slot's previous completion is still undelivered; SPI_CONFIG_ERR
         @ before configure()). Completions are delivered from activeIn, never from an ISR and
-        @ never from inside the request call.
+        @ never from inside the request call. A slot may have at most two requests outstanding
+        @ (one transfer or completion plus one refusal) between activeIn turns; a third asserts.
         import Drv.AsyncGuardedSpi
 
         @ REQUIRED CONNECTION. Main-context delivery of the completions latched by the DMAC

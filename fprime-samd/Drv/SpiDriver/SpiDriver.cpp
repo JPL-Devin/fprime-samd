@@ -51,10 +51,13 @@ SpiDriver ::SpiDriver(const char* const compName)
       m_configured(false),
       m_busy(0),
       m_hardware_chip_select(false),
-      m_pending() {
+      m_pending(),
+      m_refused() {
     for (FwIndexType i = 0; i < NUM_SPIWRITEREAD_INPUT_PORTS; i++) {
         this->m_pending[i].status = Drv::SpiStatus::SPI_OK;
         this->m_pending[i].pending = false;
+        this->m_refused[i].status = Drv::SpiStatus::SPI_BUSY_ERR;
+        this->m_refused[i].pending = false;
     }
 }
 
@@ -118,19 +121,21 @@ void SpiDriver ::SpiWriteRead_handler(FwIndexType portNum, Fw::Buffer& writeBuff
         // m_busy and the pending records are written by the ISR paths; decide and claim
         // the bus atomically.
         Samd21::CriticalSection cs;
-        // A slot may carry one undelivered outcome. If this slot's transfer is in flight,
-        // or its last outcome still waits for activeIn, nothing may be latched for it: the
-        // ISR will write (or has written) the record. Answer the caller synchronously
-        // instead (Drv.AsyncGuardedSpi only requires that every request completes through
-        // SpiWriteReadComplete) -- never an assert, the trigger is a client re-request
-        // racing a completion, not a hardware condition.
+        // A slot may carry one transfer outcome and one refusal. If this slot's transfer is
+        // in flight, or its last outcome still waits for activeIn, the ISR owns the outcome
+        // record, so the refusal is latched in the slot's refusal record and delivered by
+        // activeIn like every other completion -- nothing is called back from inside the
+        // request, and no ISR path can collide with it. A third request on the same slot
+        // before activeIn has run finds both records occupied: that is a client protocol
+        // error (caller context, not hardware traffic) and asserts.
         const bool slotInFlight = (this->m_busy != 0) && (this->m_portNum == portNum);
         if (slotInFlight || this->m_pending[portNum].pending) {
-            Samd21::CriticalSection::leave();
-            if (this->isConnected_SpiWriteReadComplete_OutputPort(portNum)) {
-                this->SpiWriteReadComplete_out(portNum, writeBuffer, readBuffer, Drv::SpiStatus::SPI_BUSY_ERR);
-            }
-            Samd21::CriticalSection::enter();
+            PendingReply& refusal = this->m_refused[portNum];
+            FW_ASSERT(!refusal.pending, portNum);
+            refusal.write = Samd21::ThinBuffer(writeBuffer);
+            refusal.read = Samd21::ThinBuffer(readBuffer);
+            refusal.status = Drv::SpiStatus::SPI_BUSY_ERR;
+            refusal.pending = true;
             return;
         }
         if (!this->m_configured) {
@@ -172,24 +177,30 @@ void SpiDriver ::SpiWriteRead_handler(FwIndexType portNum, Fw::Buffer& writeBuff
 
 bool SpiDriver ::activeIn_handler(FwIndexType portNum, U32 context) {
     for (FwIndexType slot = 0; slot < NUM_SPIWRITEREAD_INPUT_PORTS; slot++) {
-        PendingReply reply;
-        {
-            // The ISR paths write the record; copy and clear it with interrupts masked, then
-            // call the client with them enabled (the callback may start the next transfer).
-            Samd21::CriticalSection cs;
-            if (!this->m_pending[slot].pending) {
-                continue;
-            }
-            reply = this->m_pending[slot];
-            this->m_pending[slot].pending = false;
-        }
-        Fw::Buffer write = reply.write.getBuffer();
-        Fw::Buffer read = reply.read.getBuffer();
-        if (this->isConnected_SpiWriteReadComplete_OutputPort(slot)) {
-            this->SpiWriteReadComplete_out(slot, write, read, reply.status);
-        }
+        // The refusal (if any) is older than the outcome it collided with: deliver it first.
+        this->deliver(this->m_refused[slot], slot);
+        this->deliver(this->m_pending[slot], slot);
     }
     return false;
+}
+
+void SpiDriver ::deliver(PendingReply& record, FwIndexType slot) {
+    PendingReply reply;
+    {
+        // The ISR paths write the record; copy and clear it with interrupts masked, then
+        // call the client with them enabled (the callback may start the next transfer).
+        Samd21::CriticalSection cs;
+        if (!record.pending) {
+            return;
+        }
+        reply = record;
+        record.pending = false;
+    }
+    Fw::Buffer write = reply.write.getBuffer();
+    Fw::Buffer read = reply.read.getBuffer();
+    if (this->isConnected_SpiWriteReadComplete_OutputPort(slot)) {
+        this->SpiWriteReadComplete_out(slot, write, read, reply.status);
+    }
 }
 
 void SpiDriver ::dmaReplyIn_handler(FwIndexType portNum, const Samd21::Dma::Reply& reply) {
@@ -226,6 +237,9 @@ void SpiDriver ::dmaReplyIn_handler(FwIndexType portNum, const Samd21::Dma::Repl
         if (this->m_busy & otherBit) {
             this->dmaTransactionAbortOut_out(otherChannel);
         }
+        // Characters already clocked in but not collected would be read by the next
+        // transfer: drain the receiver and clear the flags, as after an overrun.
+        SpiHardware::SpiHal::acknowledgeError(this->m_sercom);
         this->m_busy = 0;
         this->deassertChipSelect();
         this->latchReply(this->m_portNum, this->m_write.getBuffer(), this->m_read.getBuffer(),

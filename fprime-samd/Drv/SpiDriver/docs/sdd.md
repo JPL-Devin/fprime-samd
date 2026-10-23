@@ -35,7 +35,7 @@ selects on `FPRIME_PLATFORM`.
 | SPI-REQ-002 | A request whose write and read buffers differ in size shall assert (full duplex). | Unit Test |
 | SPI-XFER-001 | A request shall assert the port's chip select (software mode) and queue the MISO then the MOSI DMA transaction against the SERCOM DATA register. | Unit Test, Hardware Test |
 | SPI-XFER-002 | The reply shall be emitted on the requesting port once both DMA channels complete, in either order, after the chip select is deasserted. | Unit Test, Hardware Test |
-| SPI-XFER-003 | One transaction at a time: an overlapping request on another slot shall be refused with `SPI_BUSY_ERR`, delivered from `activeIn`, and generate no DMA or chip-select traffic. A request on a slot that already holds an undelivered outcome (its transfer in flight, or its last completion not yet delivered) shall be answered synchronously with `SPI_BUSY_ERR`; the driver shall never assert on a re-request. | Unit Test |
+| SPI-XFER-003 | One transaction at a time: an overlapping request on another slot shall be refused with `SPI_BUSY_ERR`, delivered from `activeIn`, and generate no DMA or chip-select traffic. A request on a slot that already holds an undelivered outcome (its transfer in flight, or its last completion not yet delivered) shall be refused with `SPI_BUSY_ERR` from `activeIn`, delivered before that outcome, without asserting; a third request on the same slot before `activeIn` runs is a client protocol error and asserts in the caller's context. | Unit Test |
 | SPI-XFER-004 | With hardware chip select the transaction shall not drive the GPIO ports. | Unit Test |
 | SPI-XFER-005 | A DMA completion with nothing in flight, a duplicate completion of one channel, or a completion on an unknown channel shall be ignored. | Unit Test |
 | SPI-ERR-001 | `configure()` shall register for the SERCOM interrupt and enable only its `ERROR` source (receive buffer overflow, `STATUS.BUFOVF`), at the same NVIC priority as the DMAC interrupt. | Unit Test, Hardware Test |
@@ -55,12 +55,13 @@ selects on `FPRIME_PLATFORM`.
 | sync input | `activeIn` | `Svc.ActiveSched` | **required**: delivers latched completions and refusals; returns false |
 | output | `dmaTransactionOut[DmaChannel.N]` | `Dma.Transaction` | `MOSI`, `MISO` |
 | output | `dmaTransactionAbortOut[DmaChannel.N]` | `Fw.Signal` | abort a stream after a receive overrun; **ISR context** |
-| sync input | `dmaReplyIn[DmaChannel.N]` | `Dma.TransactionReply` | **ISR context**: latches only |
+| sync input | `dmaReplyIn[DmaChannel.N]` | `Dma.TransactionReply` | **ISR context**: latches only; `BUS_ERROR` aborts the other stream |
 | output | `chipSelectGpioOut[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.GpioWrite` | software chip select only |
 
 `Drv.AsyncSpiCfg.SpiDriverPorts` (F Prime default 10) should be overridden in the project
-configuration to the number of chip selects wired: each slot costs one pending-reply record
-(plus two port objects in builds without `FW_DIRECT_PORT_CALLS`; `fprime-samd-reference` uses 4).
+configuration to the number of chip selects wired: each slot costs two pending-reply records
+(outcome and refusal; plus two port objects in builds without `FW_DIRECT_PORT_CALLS`;
+`fprime-samd-reference` uses 4).
 
 ### 3.2 Configuration (`configure()`, `setBaudRate()`)
 
@@ -89,12 +90,15 @@ activeIn ─▶ for every slot with a latched reply (copied and cleared under Cr
 Nothing is delivered from an ISR: the ISR paths and the refusals only write the slot's
 pending record; `activeIn` (one pass per `Svc.PassiveCycler` turn) emits the callbacks with
 interrupts enabled, so a client may start its next transfer from inside the callback. A slot
-holds one undelivered outcome (counting the transfer in flight). A request on a slot that
-already holds one — its transfer is still in flight, or its last completion has not been
-delivered yet — is the one case answered synchronously, from inside the request call, with
-`SPI_BUSY_ERR`; it is never asserted on, because the trigger is a client re-request racing a
-completion. Stray DMA replies (nothing in flight, duplicate channel, unknown channel) are
-ignored — the driver never asserts in response to bus traffic.
+holds one undelivered outcome (counting the transfer in flight) plus one refusal. A request
+on a slot that already holds an outcome — its transfer is still in flight, or its last
+completion has not been delivered yet — is latched in the slot's refusal record as
+`SPI_BUSY_ERR` and delivered by `activeIn` ahead of the outcome; it is never asserted on,
+because the trigger is a client re-request racing a completion, and nothing is called back
+from inside the request. A third request on the same slot before `activeIn` has run finds
+both records occupied and asserts (client protocol error, caller context). Stray DMA replies
+(nothing in flight, duplicate channel, unknown channel) are ignored — the driver never asserts
+in response to bus traffic.
 
 ### 3.4 Error handling
 
@@ -115,10 +119,12 @@ driver.
 Nothing in the stack detects a transfer that produces no clock at all (e.g. SERCOM clock
 gated); that failure mode has not been observed and a tick-based timeout is left for §6.
 
-The DMA status is not currently folded into the reply (DMA bus errors surface as
-`Samd21.DmaDriver` ISR replies with `BUS_ERROR`; the SPI reply remains `SPI_OK`) — see
-§6. Caller programming errors (size mismatch, > 65535 bytes, reconfigure, re-request on a
-slot with an undelivered reply, `setBaudRate` while busy) assert.
+**DMA bus error.** A `dmaReplyIn` carrying `BUS_ERROR` (the DMAC faulted on a caller
+buffer) aborts the other stream if it is still outstanding, drains and acknowledges the
+SERCOM receiver exactly as after an overrun, deasserts the chip select and latches
+`SPI_OTHER_ERR` for the requesting slot; the next request is accepted immediately. Caller
+programming errors (size mismatch, > 65535 bytes, reconfigure, a third request on one slot
+within a single `activeIn` turn, `setBaudRate` while busy) assert in the caller's context.
 
 ### 3.5 Tested configurations
 
@@ -141,10 +147,13 @@ The CY15B102QN F-RAM driver (separate PR) is the reference consumer.
 
 ## 5. Unit tests
 
-`test/ut/` runs natively against the stub HAL (17 tests): configuration in both chip-select
+`test/ut/` runs natively against the stub HAL (19 tests): configuration in both chip-select
 modes, reconfigure assert, request before configure (`SPI_CONFIG_ERR` via `activeIn`), nominal
 transactions in both DMA completion orders on every slot, busy refusal on another slot
-(`SPI_BUSY_ERR`, delivered by `activeIn`, re-request on the slot asserts), hardware chip
+(`SPI_BUSY_ERR`, delivered by `activeIn`), re-request on the in-flight slot and on a slot with
+an undelivered completion (`SPI_BUSY_ERR` latched and delivered ahead of the outcome, third
+request asserts), DMA `BUS_ERROR` on either stream and on the second completion (other stream
+aborted, chip select released, `SPI_OTHER_ERR`, bus reusable), hardware chip
 select, size mismatch, stray/duplicate/late DMA replies ignored, `activeIn` with nothing
 pending, `setBaudRate` (idle, before configure, while busy), BAUD boundaries and overflow,
 500 randomized transactions, and the receive-overrun path (both streams outstanding, one
@@ -153,7 +162,6 @@ both chip-select modes) driven through the stub HAL's `fireIsr()`.
 
 ## 6. Future work
 
-- Propagate DMA `BUS_ERROR` into `SpiWriteReadComplete` as `SPI_WRITE_ERR`/`SPI_OTHER_ERR`.
 - A tick-based completion timeout for faults that raise no SERCOM flag (none observed).
 - Raise the MISO channel above the MOSI/UART channels in DMAC priority so the overrun
   does not occur in the first place at high SCK rates.

@@ -19,7 +19,7 @@ env:
   # which this PR's SpiDriver implements; until fprime-samd-reference#9 lands, build against
   # that PR's branch so the harness carries the interface.
   HARNESS_REPO: lestarch-autobot/fprime-samd-reference
-  HARNESS_REF: devin/1791242679-fram-driver
+  HARNESS_REF: 05ecee7e2f8fde10877cc2ca8248074b7f4efa10  # fprime-samd-reference PR #9 head (immutable pin)
   DEPLOYMENT: CuriosityReference
   TOOLCHAIN: samd21g17
   # Distinct per deployment; the reporter uses it to find and update its own comment.

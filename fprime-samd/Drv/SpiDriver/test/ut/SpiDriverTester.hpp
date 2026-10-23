@@ -68,8 +68,9 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     //! A request on another slot while a transaction is in flight is refused with SPI_BUSY_ERR from activeIn
     void testBusy();
 
-    //! A request on the slot in flight, or on a slot with an undelivered outcome, is answered
-    //! synchronously with SPI_BUSY_ERR and never asserts; the in-flight transfer completes normally
+    //! A request on the slot in flight, or on a slot with an undelivered outcome, is refused with
+    //! SPI_BUSY_ERR from activeIn ahead of the outcome, never from the request call and never
+    //! asserting; a third request on that slot asserts; the in-flight transfer completes normally
     void testSameSlotReRequest();
 
     //! A DMA BUS_ERROR on either stream aborts the other stream, releases the bus and replies SPI_OTHER_ERR

@@ -116,21 +116,31 @@ class SpiDriver final : public SpiDriverComponentBase {
                    HardwareChipSelect hardware_chipselect);
 
   private:
+    //! A latched reply: the caller's buffers and the status to deliver on activeIn.
+    struct PendingReply {
+        Samd21::ThinBuffer write;
+        Samd21::ThinBuffer read;
+        Drv::SpiStatus::T status;
+        bool pending;
+    };
+
     // ----------------------------------------------------------------------
     // Handler implementations for typed input ports
     // ----------------------------------------------------------------------
 
     //! Handler implementation for SpiWriteRead (Drv.AsyncGuardedSpi). Starts the transfer
-    //! or refuses it (SPI_BUSY_ERR, SPI_CONFIG_ERR). A refusal is latched for activeIn unless
-    //! the slot already holds an undelivered outcome (its transfer is in flight or its last
-    //! completion has not been delivered yet); then SPI_BUSY_ERR is answered synchronously
-    //! from inside this call, so a slot never carries two outcomes and no ISR path asserts.
+    //! or refuses it (SPI_BUSY_ERR, SPI_CONFIG_ERR); every outcome is latched and delivered
+    //! by activeIn, never from inside this call. A request on a slot whose transfer is in
+    //! flight, or whose last outcome activeIn has not delivered yet, is latched in the slot's
+    //! refusal record (SPI_BUSY_ERR) so it cannot collide with the ISR's outcome record. A
+    //! third request on that slot before activeIn runs is a client protocol error and asserts
+    //! in the caller's context.
     void SpiWriteRead_handler(FwIndexType portNum,  //!< The port number
                               Fw::Buffer& writeBuffer,
                               Fw::Buffer& readBuffer) override;
 
-    //! Handler implementation for activeIn: delivers every latched reply (main context).
-    //! Returns false (no further work this cycle).
+    //! Handler implementation for activeIn: delivers every latched reply (main context),
+    //! per slot the refusal before the outcome. Returns false (no further work this cycle).
     bool activeIn_handler(FwIndexType portNum,  //!< The port number
                           U32 context           //!< The call order
                           ) override;
@@ -158,6 +168,10 @@ class SpiDriver final : public SpiDriverComponentBase {
 
     //! Release the chip select of the transfer in flight (software chip select only)
     void deassertChipSelect();
+
+    //! Copy-and-clear `record` under a critical section and, if it was pending, emit it on
+    //! SpiWriteReadComplete[slot] with interrupts enabled.
+    void deliver(PendingReply& record, FwIndexType slot);
 
     //! Latch a reply for `portNum` to be delivered by the next activeIn. The slot is free
     //! by construction (SpiWriteRead_handler refuses synchronously otherwise); the assert
@@ -189,17 +203,16 @@ class SpiDriver final : public SpiDriverComponentBase {
 
     bool m_hardware_chip_select;
 
-    //! One completion waiting for activeIn, per slot. Written by the ISR paths (transfer
-    //! done, DMA bus error, receive overrun) and by refused requests; read and cleared by
-    //! activeIn under a critical section. Invariant: a slot holds at most one undelivered
-    //! outcome, counting the transfer in flight.
-    struct PendingReply {
-        Samd21::ThinBuffer write;
-        Samd21::ThinBuffer read;
-        Drv::SpiStatus::T status;
-        bool pending;
-    };
+    //! One transfer outcome waiting for activeIn, per slot. Written by the ISR paths
+    //! (transfer done, DMA bus error, receive overrun) and by requests refused while the
+    //! bus is idle; read and cleared by activeIn under a critical section. Invariant: a slot
+    //! holds at most one undelivered outcome, counting the transfer in flight.
     PendingReply m_pending[NUM_SPIWRITEREAD_INPUT_PORTS];
+
+    //! One SPI_BUSY_ERR refusal waiting for activeIn, per slot, for a request that arrived
+    //! while the slot's outcome record was still owned by the transfer in flight or by an
+    //! undelivered completion. Written in the caller's context only.
+    PendingReply m_refused[NUM_SPIWRITEREAD_INPUT_PORTS];
 };
 
 }  // namespace Samd21
