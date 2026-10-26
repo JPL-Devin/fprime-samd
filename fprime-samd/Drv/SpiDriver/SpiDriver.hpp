@@ -99,8 +99,11 @@ class SpiDriver final : public SpiDriverComponentBase {
     static U8 calculateBaud(U32 f_ref_hz, U32 baud_rate_khz);
 
     //! Change the SCK rate of a configured driver (e.g. SD card: slow for identification,
-    //! fast afterwards). Asserts when not configured or while a transfer is in flight.
-    void setBaudRate(U32 baud_rate_khz);
+    //! fast afterwards). Returns SPI_CONFIG_ERR before configure() and SPI_BUSY_ERR while a
+    //! transfer is in flight, leaving the rate unchanged; otherwise applies the rate and
+    //! returns SPI_OK. Asserts only for a rate the clock cannot produce (calculateBaud).
+    //! Implementation of the setBaudRate port; callable directly from C++ as well.
+    Drv::SpiStatus setBaudRate(U32 baud_rate_khz);
 
     //! Configure a SERCOM device for SPI Master (host) mode. Registers the SERCOM ERROR
     //! interrupt, deasserts every connected software chip select and marks the driver
@@ -140,6 +143,11 @@ class SpiDriver final : public SpiDriverComponentBase {
     void SpiWriteRead_handler(FwIndexType portNum,  //!< The port number
                               Fw::Buffer& writeBuffer,
                               Fw::Buffer& readBuffer) override;
+
+    //! Handler implementation for setBaudRate (main context): see setBaudRate()
+    Drv::SpiStatus setBaudRate_handler(FwIndexType portNum,  //!< The port number
+                                       U32 baud_rate_khz     //!< SCK rate in kHz
+                                       ) override;
 
     //! Handler implementation for activeIn: delivers every latched reply (main context),
     //! per slot the refusal before the outcome. Returns false (no further work this cycle).

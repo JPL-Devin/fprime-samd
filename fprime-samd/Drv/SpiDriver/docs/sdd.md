@@ -32,6 +32,8 @@ selects on `FPRIME_PLATFORM`.
 | SPI-CFG-005 | The BAUD register shall be computed as `fref / (2 * fsck) - 1`, rounded so the real SCK never exceeds the requested rate. | Unit Test |
 | SPI-CFG-006 | `calculateBaud` shall assert on a zero rate, a rate above `fref / 2`, or a rate too slow for the 8-bit register, before any arithmetic that could overflow. | Unit Test |
 | SPI-CFG-007 | With software chip select, `configure()` shall assert if a connected chip-select GPIO cannot be driven (`GpioStatus` other than `OP_OK`): the pin was not opened as an output before the driver was configured, an integration error. | Unit Test |
+| SPI-CFG-008 | The SCK rate shall be changeable at runtime through the `setBaudRate` port (and the `setBaudRate()` method behind it): `SPI_CONFIG_ERR` before `configure()`, `SPI_BUSY_ERR` while a transfer is in flight, otherwise `SPI_OK`; the rate is left unchanged in both error cases and none of these paths asserts. A completed transfer whose reply `activeIn` has not delivered yet does not count as in flight. | Unit Test |
+| SPI-CFG-009 | A baud change shall leave the SERCOM enabled: it disables the peripheral, rewrites the enable-protected `BAUD` register and re-enables it, waiting for `SYNCBUSY.ENABLE` each way, so that the next transfer completes normally. | Unit Test |
 | SPI-REQ-001 | A request issued before `configure()` shall be refused with `SPI_CONFIG_ERR`, delivered from `activeIn`, and generate no DMA or chip-select traffic. | Unit Test |
 | SPI-REQ-002 | A request whose write and read buffers differ in size shall assert (full duplex). | Unit Test |
 | SPI-XFER-001 | A request shall assert the port's chip select (software mode) and queue the MISO then the MOSI DMA transaction against the SERCOM DATA register. | Unit Test, Hardware Test |
@@ -55,6 +57,7 @@ selects on `FPRIME_PLATFORM`.
 | guarded input | `SpiWriteRead[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.SpiWriteReadRequest` | from `Drv.AsyncGuardedSpi`; index = chip-select slot |
 | output | `SpiWriteReadComplete[Drv.AsyncSpiCfg.SpiDriverPorts]` | `Drv.SpiWriteReadCallback` | **main context**, from `activeIn`; exactly one per request |
 | sync input | `activeIn` | `Svc.ActiveSched` | **required**: delivers latched completions and refusals; returns false |
+| sync input | `setBaudRate` | `Samd21.SpiBaudRate` | **main context**, same caller as `SpiWriteRead`; runtime SCK change, returns `Drv.SpiStatus` (§3.2) |
 | output | `dmaTransactionOut[DmaChannel.N]` | `Dma.Transaction` | `MOSI`, `MISO` |
 | output | `dmaTransactionAbortOut[DmaChannel.N]` | `Fw.Signal` | abort a stream after a receive overrun or a DMA bus error; **ISR context** |
 | sync input | `dmaReplyIn[DmaChannel.N]` | `Dma.TransactionReply` | **ISR context**: latches the outcome; on `BUS_ERROR` aborts the other stream, acknowledges the SERCOM and releases the chip select (§3.4) |
@@ -63,7 +66,9 @@ selects on `FPRIME_PLATFORM`.
 `Drv.AsyncSpiCfg.SpiDriverPorts` (F Prime default 10) should be overridden in the project
 configuration to the number of chip selects wired: each slot costs two pending-reply records
 (outcome and refusal; plus three port objects -- request, completion, chip select -- in builds
-without `FW_DIRECT_PORT_CALLS`; `fprime-samd-reference` uses 4).
+without `FW_DIRECT_PORT_CALLS`; `fprime-samd-reference` uses 4). The `setBaudRate` port is one
+object per driver, not per slot, and is optional: leave it unconnected if no client changes the
+rate.
 
 ### 3.2 Configuration (`configure()`, `setBaudRate()`)
 
@@ -72,9 +77,18 @@ DataOutPinout, RunInStandby, HardwareChipSelect)` — called once from a `config
 phase. The caller routes the pads (`Samd21::PinMux::configure`) and configures the
 chip-select GPIO as an output **before** this call, because `configure()` deasserts
 every connected software chip select. The GCLK core clock (`F_CPU`) is the baud reference.
-`setBaudRate(baud_rate_khz)` changes SCK afterwards (SD cards: slow identification, fast data);
-it disables the SERCOM, rewrites the enable-protected `BAUD` and re-enables, and asserts when
-called before `configure()` or with a transfer in flight.
+`setBaudRate(baud_rate_khz)` -- the `setBaudRate` port, or the C++ method of the same name
+that implements it -- changes SCK afterwards (SD cards: slow identification, fast data, and
+again after a bus manager power-cycles the card). It returns `SPI_CONFIG_ERR` before
+`configure()` and `SPI_BUSY_ERR` while a transfer is in flight, both without touching the
+hardware; a transfer that has finished but whose reply `activeIn` has not delivered yet is not
+in flight. Otherwise the HAL disables the SERCOM (`CTRLA.ENABLE = 0`, wait `SYNCBUSY.ENABLE`),
+rewrites the enable-protected `BAUD` register, re-enables (`CTRLA.ENABLE = 1`, wait
+`SYNCBUSY.ENABLE`) and `SPI_OK` is returned. Disabling does not reset any other register
+(only `CTRLA.SWRST` does, DS40001882 §27.6.2.2), so mode, pinout, `INTENSET` and the DMA
+trigger survive the cycle. The only assertion on this path is `calculateBaud` (SPI-CFG-006):
+a rate the clock cannot produce is an integration error, not a runtime condition. The HAL
+bounds each `SYNCBUSY` wait and asserts if the bit never clears (clock not running).
 
 ### 3.3 Transaction behaviour
 
@@ -130,7 +144,8 @@ buffer) aborts the other stream if it is still outstanding, drains and acknowled
 SERCOM receiver exactly as after an overrun, deasserts the chip select and latches
 `SPI_OTHER_ERR` for the requesting slot; the next request is accepted immediately. Caller
 programming errors (size mismatch, > 65535 bytes, reconfigure, a third request on one slot
-within a single `activeIn` turn, `setBaudRate` while busy) assert in the caller's context.
+within a single `activeIn` turn) assert in the caller's context; `setBaudRate` while busy or
+before `configure()` is reported through its return status instead (§3.2).
 
 ### 3.5 Tested configurations
 
@@ -153,7 +168,7 @@ The CY15B102QN F-RAM driver (separate PR) is the reference consumer.
 
 ## 5. Unit tests
 
-`test/ut/` runs natively against the stub HAL (20 tests): configuration in both chip-select
+`test/ut/` runs natively against the stub HAL (21 tests): configuration in both chip-select
 modes, reconfigure assert, request before configure (`SPI_CONFIG_ERR` via `activeIn`), nominal
 transactions in both DMA completion orders on every slot, busy refusal on another slot
 (`SPI_BUSY_ERR`, delivered by `activeIn`), re-request on the in-flight slot and on a slot with
@@ -162,7 +177,9 @@ request asserts), DMA `BUS_ERROR` on either stream and on the second completion 
 aborted, chip select released, `SPI_OTHER_ERR`, bus reusable), hardware chip
 select, chip select refused by the GPIO driver (`SPI_OTHER_ERR`, no DMA traffic; assert in
 `configure()`), size mismatch, stray/duplicate/late DMA replies ignored, `activeIn` with nothing
-pending, `setBaudRate` (idle, before configure, while busy), BAUD boundaries and overflow,
+pending, `setBaudRate` method and port (idle, before configure, while busy, with a latched
+undelivered reply; the stub HAL models the SERCOM enable state and the test proves a full
+transfer completes with `SPI_OK` after the change), BAUD boundaries and overflow,
 500 randomized transactions, and the receive-overrun path (both streams outstanding, one
 stream outstanding, spurious interrupt, overrun while idle, recovery on every slot and in
 both chip-select modes) driven through the stub HAL's `fireIsr()`.

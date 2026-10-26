@@ -41,6 +41,11 @@ TEST(Nominal, SetBaudRate) {
     tester.testSetBaudRate();
 }
 
+TEST(Nominal, SetBaudRatePort) {
+    Samd21::SpiDriverTester tester;
+    tester.testSetBaudRatePort();
+}
+
 TEST(Nominal, SchedIdle) {
     Samd21::SpiDriverTester tester;
     tester.testSchedIdle();

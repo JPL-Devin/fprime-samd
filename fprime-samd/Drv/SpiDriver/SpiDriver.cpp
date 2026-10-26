@@ -105,15 +105,29 @@ void SpiDriver ::configure(SercomKind sercom,
     this->m_configured = true;
 }
 
-void SpiDriver ::setBaudRate(U32 baud_rate_khz) {
-    FW_ASSERT(this->m_configured, this->m_sercom);
-    FW_ASSERT(this->m_busy == 0, this->m_sercom, this->m_busy);
+Drv::SpiStatus SpiDriver ::setBaudRate(U32 baud_rate_khz) {
+    if (!this->m_configured) {
+        return Drv::SpiStatus::SPI_CONFIG_ERR;
+    }
+    {
+        // m_busy is cleared by the DMAC ISR. Idle cannot become busy behind our back: only
+        // SpiWriteRead_handler (this same main context) starts a transfer.
+        Samd21::CriticalSection cs;
+        if (this->m_busy != 0) {
+            return Drv::SpiStatus::SPI_BUSY_ERR;
+        }
+    }
     SpiHardware::SpiHal::setBaudRate(this->m_sercom, baud_rate_khz);
+    return Drv::SpiStatus::SPI_OK;
 }
 
 // ----------------------------------------------------------------------
 // Handler implementations for typed input ports
 // ----------------------------------------------------------------------
+
+Drv::SpiStatus SpiDriver ::setBaudRate_handler(FwIndexType portNum, U32 baud_rate_khz) {
+    return this->setBaudRate(baud_rate_khz);
+}
 
 void SpiDriver ::SpiWriteRead_handler(FwIndexType portNum, Fw::Buffer& writeBuffer, Fw::Buffer& readBuffer) {
     // Caller contract (not a hardware condition): both streams clock the same number of bytes

@@ -93,7 +93,14 @@ struct StubState {
 
     // acknowledgeError() capture
     U32 acknowledge_error_count;
+
+    // setBaudRate() capture, and the SERCOM enable state it cycles. configure() enables;
+    // setBaudRate() disables, writes BAUD and re-enables (enable_count counts re-enables).
+    // data_register_reads_while_disabled counts transfers started against a disabled SERCOM.
     U32 set_baud_count;
+    bool enabled;
+    U32 enable_count;
+    U32 data_register_reads_while_disabled;
 };
 
 //! Invoke the registered ISR callback as the SERCOM interrupt would

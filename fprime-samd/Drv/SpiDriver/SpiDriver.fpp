@@ -1,4 +1,11 @@
 module Samd21 {
+    @ Change the SCK rate of an SPI driver at runtime. Returns SPI_OK when the new rate
+    @ is in effect, SPI_CONFIG_ERR before the driver is configured and SPI_BUSY_ERR while
+    @ a transfer is in flight (the rate is left unchanged in both error cases).
+    port SpiBaudRate(
+        baud_rate_khz: U32 @< SCK rate in kHz
+    ) -> Drv.SpiStatus
+
     @ Driver for the SAMD21 SPI Peripheral (host mode, DMA in both directions)
     passive component SpiDriver {
 
@@ -33,6 +40,15 @@ module Samd21 {
         @ Svc.PassiveCycler (cycleOut), at a lower index than the components that consume the
         @ completions. Always returns false: delivering replies leaves no work for this cycle.
         sync input port activeIn: Svc.ActiveSched
+
+        @ Runtime SCK rate change for bus managers that re-initialise a device during normal
+        @ operation (e.g. an SD card: slow for identification, fast for data, again after a
+        @ power cycle). Main context only, same caller as SpiWriteRead. SPI_CONFIG_ERR before
+        @ configure(), SPI_BUSY_ERR while a transfer is in flight (a completed transfer whose
+        @ reply activeIn has not delivered yet does not block it), otherwise the SERCOM is
+        @ disabled, BAUD rewritten and the SERCOM re-enabled before SPI_OK is returned. A rate
+        @ the clock cannot produce (SPI-CFG-006) is an integration error and asserts.
+        sync input port setBaudRate: SpiBaudRate
 
         @ Port to send a DMA transaction to the DMA driver
         output port dmaTransactionOut: [DmaChannel.N] Dma.Transaction

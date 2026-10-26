@@ -469,18 +469,65 @@ void SpiDriverTester ::testReceiveOverrunIdle() {
 }
 
 void SpiDriverTester ::testSetBaudRate() {
-    // REQUIREMENT(SPI-CFG-006): the SCK rate can be changed after configure() while idle; it asserts
-    //                            before configure() and while a transfer is in flight
-    ASSERT_DEATH_IF_SUPPORTED(this->component.setBaudRate(1000), "");
+    // REQUIREMENT(SPI-CFG-008): the C++ method reports SPI_CONFIG_ERR before configure() and SPI_BUSY_ERR
+    //                            while a transfer is in flight (rate unchanged), SPI_OK when idle
+    ASSERT_EQ(this->component.setBaudRate(1000), Drv::SpiStatus::SPI_CONFIG_ERR);
+    ASSERT_EQ(SpiHardware::getStubState().set_baud_count, 0u);
     this->configure(SpiDriver::HardwareChipSelect::DISABLED);
-    this->component.setBaudRate(400);
+    ASSERT_EQ(this->component.setBaudRate(400), Drv::SpiStatus::SPI_OK);
     ASSERT_EQ(SpiHardware::getStubState().baud_rate_khz, 400u);
     ASSERT_EQ(SpiHardware::getStubState().set_baud_count, 1u);
     this->startTransaction(0, 4);
-    ASSERT_DEATH_IF_SUPPORTED(this->component.setBaudRate(8000), "");
+    ASSERT_EQ(this->component.setBaudRate(8000), Drv::SpiStatus::SPI_BUSY_ERR);
+    ASSERT_EQ(SpiHardware::getStubState().baud_rate_khz, 400u);
+    ASSERT_EQ(SpiHardware::getStubState().set_baud_count, 1u);
     this->finishTransaction(0, true);
-    this->component.setBaudRate(8000);
+    ASSERT_EQ(this->component.setBaudRate(8000), Drv::SpiStatus::SPI_OK);
     ASSERT_EQ(SpiHardware::getStubState().baud_rate_khz, 8000u);
+    ASSERT_EQ(SpiHardware::getStubState().set_baud_count, 2u);
+}
+
+void SpiDriverTester ::testSetBaudRatePort() {
+    // REQUIREMENT(SPI-CFG-008): the setBaudRate port returns SPI_CONFIG_ERR before configure(), SPI_BUSY_ERR
+    //                            while a transfer is in flight (rate unchanged) and SPI_OK otherwise
+    // REQUIREMENT(SPI-CFG-009): after a baud change the SERCOM is enabled again and a full transfer
+    //                            completes with SPI_OK (the bus is not left disabled)
+    ASSERT_EQ(this->invoke_to_setBaudRate(0, 400), Drv::SpiStatus::SPI_CONFIG_ERR);
+    ASSERT_EQ(SpiHardware::getStubState().set_baud_count, 0u);
+    ASSERT_FALSE(SpiHardware::getStubState().enabled);
+
+    this->configure(SpiDriver::HardwareChipSelect::DISABLED);
+    ASSERT_TRUE(SpiHardware::getStubState().enabled);
+    ASSERT_EQ(this->invoke_to_setBaudRate(0, 400), Drv::SpiStatus::SPI_OK);
+    ASSERT_EQ(SpiHardware::getStubState().baud_rate_khz, 400u);
+    ASSERT_EQ(SpiHardware::getStubState().set_baud_count, 1u);
+    ASSERT_EQ(SpiHardware::getStubState().enable_count, 1u);
+    ASSERT_TRUE(SpiHardware::getStubState().enabled);
+
+    // In flight: refused, nothing touched
+    this->startTransaction(0, 4);
+    ASSERT_EQ(this->invoke_to_setBaudRate(0, 8000), Drv::SpiStatus::SPI_BUSY_ERR);
+    ASSERT_EQ(SpiHardware::getStubState().baud_rate_khz, 400u);
+    ASSERT_EQ(SpiHardware::getStubState().set_baud_count, 1u);
+
+    // Both DMA streams done but activeIn not yet run: the latched reply does not block the change
+    this->clearAll();
+    this->completeDma(SpiDriver_DmaChannel::MOSI);
+    this->completeDma(SpiDriver_DmaChannel::MISO);
+    ASSERT_from_SpiWriteReadComplete_SIZE(0);
+    ASSERT_EQ(this->invoke_to_setBaudRate(0, 8000), Drv::SpiStatus::SPI_OK);
+    ASSERT_EQ(SpiHardware::getStubState().baud_rate_khz, 8000u);
+    ASSERT_EQ(SpiHardware::getStubState().set_baud_count, 2u);
+    ASSERT_EQ(SpiHardware::getStubState().enable_count, 2u);
+    ASSERT_TRUE(SpiHardware::getStubState().enabled);
+    this->assertReply(0, Drv::SpiStatus::SPI_OK);
+
+    // Not bricked: a complete transfer after the change is clocked out and completes with SPI_OK
+    this->startTransaction(0, 8);
+    ASSERT_EQ(SpiHardware::getStubState().data_register_reads_while_disabled, 0u);
+    this->finishTransaction(0, false);
+    ASSERT_TRUE(SpiHardware::getStubState().enabled);
+    ASSERT_EQ(SpiHardware::getStubState().data_register_reads_while_disabled, 0u);
 }
 
 void SpiDriverTester ::testSchedIdle() {

@@ -57,15 +57,25 @@ void SpiHal::configure(SercomKind sercom,
     s_state.data_out_pinout = data_out_pinout;
     s_state.run_in_standby = run_in_standby;
     s_state.hardware_chipselect = hardware_chipselect;
+    s_state.enabled = true;
 }
 
 void SpiHal::setBaudRate(SercomKind sercom, U32 baud_rate_khz) {
+    // Mirror the real HAL: BAUD is enable-protected, so the SERCOM is disabled around the
+    // write and must come back enabled or every later transfer is lost.
+    s_state.enabled = false;
     s_state.baud_rate_khz = baud_rate_khz;
     s_state.set_baud_count++;
+    s_state.enabled = true;
+    s_state.enable_count++;
 }
 
 U32 SpiHal::getDataRegisterAddress(SercomKind sercom) {
     (void)sercom;
+    // Called when a transfer is started: a disabled SERCOM would never clock the DMA
+    if (!s_state.enabled) {
+        s_state.data_register_reads_while_disabled++;
+    }
     return s_state.data_register_address;
 }
 

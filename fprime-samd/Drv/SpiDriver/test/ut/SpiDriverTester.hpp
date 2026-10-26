@@ -100,6 +100,7 @@ class SpiDriverTester final : public SpiDriverGTestBase {
     void testSpuriousInterrupt();
     void testReceiveOverrunIdle();
     void testSetBaudRate();
+    void testSetBaudRatePort();
     void testSchedIdle();
 
   private:
