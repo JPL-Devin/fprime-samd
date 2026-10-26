@@ -4,7 +4,7 @@
 // ======================================================================
 #include "fprime-samd/Drv/SpiDriver/SpiDriverHardware.hpp"
 
-#include <samd21/include/samd21g17a.h>
+#include <sam.h>
 
 #include "Fw/Types/Assert.hpp"
 #include "config/FwAssertArgTypeAliasAc.h"
