@@ -273,12 +273,16 @@ void SpiHal::configure(SercomKind sercom,
 void SpiHal::setBaudRate(SercomKind sercom, U32 baud_rate_khz) {
     auto* sercom_hw = SercomUtil::getHardware(sercom);
     FW_ASSERT(sercom_hw != nullptr, static_cast<FwAssertArgType>(sercom));
-    // BAUD is enable-protected (§27.6.2.1): stop the peripheral, write, restart. The
-    // shifter is idle by contract (the driver only calls this with no transfer in flight),
-    // so nothing is lost.
+    // Validate the rate (asserts) before the peripheral is touched, so an integration
+    // error never fires with the SERCOM disabled
+    const U8 baud = SpiDriver::calculateBaud(F_CPU, baud_rate_khz);
+    // BAUD is enable-protected (§27.6.2.1): stop the peripheral, write, restart. Disabling
+    // does not reset any other register (only CTRLA.SWRST does, §27.6.2.2), so mode, pinout,
+    // INTENSET and the DMA triggers survive. The shifter is idle by contract (the driver only
+    // calls this with no transfer in flight), so nothing is lost.
     sercom_hw->SPI.CTRLA.bit.ENABLE = 0;
     waitForSpiSync(sercom_hw, SERCOM_SPI_SYNCBUSY_ENABLE);
-    sercom_hw->SPI.BAUD.reg = SERCOM_SPI_BAUD_BAUD(SpiDriver::calculateBaud(F_CPU, baud_rate_khz));
+    sercom_hw->SPI.BAUD.reg = SERCOM_SPI_BAUD_BAUD(baud);
     sercom_hw->SPI.CTRLA.reg |= SERCOM_SPI_CTRLA_ENABLE;
     waitForSpiSync(sercom_hw, SERCOM_SPI_SYNCBUSY_ENABLE);
 }
